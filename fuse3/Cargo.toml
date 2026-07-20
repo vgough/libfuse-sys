@@ -1,0 +1,8 @@
+[package]
+name = "fuse3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libfuse-sys = { path = "..", default-features = false, features = ["fuse_lowlevel"] }
+libc = "0.2"

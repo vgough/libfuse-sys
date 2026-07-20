@@ -42,6 +42,30 @@ cat /tmp/hello_mnt/hello
 Unmount it with `umount /tmp/hello_mnt` on macOS or `fusermount3 -u /tmp/hello_mnt` on
 Linux.
 
+## The `fuse3` crate: a safe wrapper
+
+If you're writing a new filesystem, prefer the [`fuse3`](fuse3/) crate in this workspace
+over the raw bindings above. It's a safe, Rust-friendly low-level FUSE API built on top of
+`libfuse-sys`: implement the `Filesystem` trait with ordinary `&str`/`Result<T, Errno>`
+methods and hand it to `Session` - no `unsafe`, no C types, no `#[cfg(target_os = ...)]`
+required in your code.
+
+```rust
+impl Filesystem for HelloFs {
+    fn lookup(&mut self, _req: &Request, parent: Inode, name: &str) -> Result<Entry, Errno> {
+        if parent != ROOT_INODE || name != "hello" {
+            return Err(Errno::ENOENT);
+        }
+        Ok(Entry { ino: 2, attr: self.hello_attr(), ..Default::default() })
+    }
+    // ... getattr, open, read, readdir
+}
+
+Session::mount_and_run(HelloFs::new(), &mountpoint, &[])?;
+```
+
+See `fuse3/README.md` for details and `fuse3/examples/hello_ll.rs` for the full example.
+
 ## License
 
 This crate itself is published under the MIT license while libfuse is published under
