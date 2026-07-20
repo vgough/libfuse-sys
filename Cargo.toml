@@ -18,6 +18,10 @@ libc = "0.2"
 bindgen = "0.72.1"
 pkg-config = "0.3"
 
+[[example]]
+name = "hello_ll"
+required-features = ["fuse_lowlevel"]
+
 [features]
 default = ["fuse_highlevel", "fuse_lowlevel"]
 

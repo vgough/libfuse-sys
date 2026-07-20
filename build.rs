@@ -19,6 +19,7 @@ macro_rules! version {
     };
 }
 
+#[cfg(any(feature = "fuse_highlevel", feature = "fuse_lowlevel"))]
 fn fuse_binding_filter(builder: bindgen::Builder) -> bindgen::Builder {
     let mut builder = builder
         // Whitelist "fuse_*" symbols and blocklist everything else
@@ -36,6 +37,7 @@ fn fuse_binding_filter(builder: bindgen::Builder) -> bindgen::Builder {
     builder
 }
 
+#[cfg(feature = "cuse_lowlevel")]
 fn cuse_binding_filter(builder: bindgen::Builder) -> bindgen::Builder {
     builder
         // Whitelist "cuse_*" symbols and blocklist everything else

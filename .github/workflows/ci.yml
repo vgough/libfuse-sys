@@ -33,7 +33,7 @@ jobs:
         run: sudo apt-get install -y libfuse3-dev
 
       - name: Build
-        run: cargo build --features fuse_35 --verbose
+        run: cargo build --features fuse_35 --examples --verbose
 
 
   build-macos-11:

@@ -31,6 +31,25 @@ You can select other API versions for fuse. Currently supported are
 
 If no version is selected the crate defaults to version 35.
 
+## Example
+
+`examples/hello_ll.rs` is a Rust port of libfuse's classic `hello_ll.c`: a read-only
+filesystem exposing a single file, `hello`, containing "Hello World!\n". It uses the
+lowlevel FUSE 3.x API, so it requires building without a FUSE 2.x version feature.
+
+```sh
+mkdir /tmp/hello_mnt
+cargo run --example hello_ll -- /tmp/hello_mnt
+```
+
+In another terminal:
+```sh
+cat /tmp/hello_mnt/hello
+```
+
+Unmount it with `umount /tmp/hello_mnt` on macOS or `fusermount3 -u /tmp/hello_mnt` on
+Linux.
+
 ## License
 
 This crate itself is published under the MIT license while libfuse is published under

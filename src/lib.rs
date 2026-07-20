@@ -5,6 +5,7 @@
 #![allow(clippy::cognitive_complexity)]
 #![allow(clippy::missing_safety_doc)]
 
+#[cfg(feature = "fuse_highlevel")]
 use libc::*;
 
 #[cfg(feature = "fuse_highlevel")]
@@ -41,13 +42,12 @@ pub mod fuse {
 }
 
 #[cfg(feature = "fuse_lowlevel")]
+#[allow(clashing_extern_declarations)]
 pub mod fuse_lowlevel {
-    use super::*;
     include!(concat!(env!("OUT_DIR"), "/fuse_lowlevel.rs"));
 }
 
 #[cfg(feature = "cuse_lowlevel")]
 pub mod cuse_lowlevel {
-    use super::*;
     include!(concat!(env!("OUT_DIR"), "/cuse_lowlevel.rs"));
 }
