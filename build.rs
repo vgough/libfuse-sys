@@ -116,12 +116,12 @@ fn main() {
     version!(api_version, "fuse_31", 31);
     version!(api_version, "fuse_35", 35);
     // Warn if no API version is selected
-    if api_version.is_none() {
-        println!(
-            "cargo:warning=No FUSE API version feature selected. Defaulting to version {}.",
-            FUSE_DEFAULT_API_VERSION
-        );
-    }
+    // if api_version.is_none() {
+    //     println!(
+    //         "cargo:warning=No FUSE API version feature selected. Defaulting to version {}.",
+    //         FUSE_DEFAULT_API_VERSION
+    //     );
+    // }
     // Fall back to default version
     let api_version = api_version.unwrap_or(FUSE_DEFAULT_API_VERSION);
 
