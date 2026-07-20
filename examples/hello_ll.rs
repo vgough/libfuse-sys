@@ -17,6 +17,24 @@ mod imp {
     type Attr = stat;
     type EntryParam = fuse_entry_param;
 
+    #[derive(Clone, Copy)]
+    struct MountTime {
+        seconds: i64,
+        nanoseconds: i64,
+    }
+
+    impl MountTime {
+        fn now() -> Self {
+            let duration = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            Self {
+                seconds: duration.as_secs() as i64,
+                nanoseconds: duration.subsec_nanos() as i64,
+            }
+        }
+    }
+
     // On macOS, libfuse's headers declare fuse_reply_entry()/fuse_reply_attr()/
     // fuse_add_direntry() with "Darwin extensions" enabled by default, which aliases
     // them (via an asm symbol rename) to `<name>$DARWIN` and switches their argument
@@ -46,7 +64,31 @@ mod imp {
     #[cfg(target_os = "macos")]
     use fuse_reply_entry_vanilla as fuse_reply_entry;
 
-    fn hello_stat(ino: fuse_ino_t) -> Option<Attr> {
+    fn mount_time(req: fuse_req_t) -> &'static MountTime {
+        unsafe { &*(fuse_req_userdata(req) as *const MountTime) }
+    }
+
+    fn set_times(attr: &mut Attr, mounted_at: MountTime) {
+        #[cfg(target_os = "macos")]
+        {
+            attr.st_atimespec.tv_sec = mounted_at.seconds as _;
+            attr.st_atimespec.tv_nsec = mounted_at.nanoseconds as _;
+            attr.st_mtimespec = attr.st_atimespec;
+            attr.st_ctimespec = attr.st_atimespec;
+            attr.st_birthtimespec = attr.st_atimespec;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            attr.st_atime = mounted_at.seconds as _;
+            attr.st_atime_nsec = mounted_at.nanoseconds as _;
+            attr.st_mtime = mounted_at.seconds as _;
+            attr.st_mtime_nsec = mounted_at.nanoseconds as _;
+            attr.st_ctime = mounted_at.seconds as _;
+            attr.st_ctime_nsec = mounted_at.nanoseconds as _;
+        }
+    }
+
+    fn hello_stat(ino: fuse_ino_t, mounted_at: MountTime) -> Option<Attr> {
         let mut attr: Attr = unsafe { std::mem::zeroed() };
         attr.st_ino = ino;
         match ino {
@@ -61,6 +103,7 @@ mod imp {
             }
             _ => return None,
         }
+        set_times(&mut attr, mounted_at);
         Some(attr)
     }
 
@@ -75,12 +118,12 @@ mod imp {
         e.ino = 2;
         e.attr_timeout = 1.0;
         e.entry_timeout = 1.0;
-        e.attr = hello_stat(2).unwrap();
+        e.attr = hello_stat(2, *mount_time(req)).unwrap();
         unsafe { fuse_reply_entry(req, &e) };
     }
 
     unsafe extern "C" fn hello_ll_getattr(req: fuse_req_t, ino: fuse_ino_t, _fi: *mut fuse_file_info) {
-        match hello_stat(ino) {
+        match hello_stat(ino, *mount_time(req)) {
             Some(attr) => {
                 unsafe { fuse_reply_attr(req, &attr, 1.0) };
             }
@@ -96,8 +139,7 @@ mod imp {
             unsafe { fuse_add_direntry(req, ptr::null_mut(), 0, name.as_ptr(), ptr::null(), 0) };
         buf.resize(old_size + entry_size, 0);
 
-        let mut attr: Attr = unsafe { std::mem::zeroed() };
-        attr.st_ino = ino;
+        let attr = hello_stat(ino, *mount_time(req)).unwrap();
         unsafe {
             fuse_add_direntry(
                 req,
@@ -182,6 +224,7 @@ mod imp {
 
     unsafe fn run_session(args: &mut fuse_args, opts: &fuse_cmdline_opts) -> c_int {
         let ops = hello_ll_oper();
+        let mut mounted_at = MountTime::now();
         let mut version = libfuse_version {
             major: FUSE_MAJOR_VERSION as _,
             minor: FUSE_MINOR_VERSION as _,
@@ -199,7 +242,7 @@ mod imp {
                 &ops,
                 size_of::<fuse_lowlevel_ops>(),
                 &mut version,
-                ptr::null_mut(),
+                &mut mounted_at as *mut MountTime as *mut c_void,
             )
         };
         if se.is_null() {
