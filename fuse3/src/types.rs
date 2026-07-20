@@ -531,6 +531,35 @@ impl OpenReply {
 }
 
 // ---------------------------------------------------------------------
+// XattrReply
+// ---------------------------------------------------------------------
+
+/// The reply to `getxattr`/`listxattr`.
+///
+/// The kernel's xattr protocol is two-phase: it first sends a request with
+/// `size == 0` asking only for the length of the value (so it can size a
+/// buffer), then repeats the request with a non-zero `size` to fetch the
+/// data. [`XattrReply::Size`] answers the first phase without having to
+/// materialize the data; [`XattrReply::Data`] answers either phase (on a
+/// size query only its length is sent).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum XattrReply {
+    /// The value's length in bytes, for answering a size query
+    /// (`size == 0`) without allocating the data. Returning this for a
+    /// data request (`size > 0`) is an implementation error and is
+    /// answered with `EIO`.
+    Size(usize),
+    /// The value itself.
+    Data(Vec<u8>),
+}
+
+impl From<Vec<u8>> for XattrReply {
+    fn from(data: Vec<u8>) -> Self {
+        XattrReply::Data(data)
+    }
+}
+
+// ---------------------------------------------------------------------
 // SetAttrs
 // ---------------------------------------------------------------------
 
@@ -744,7 +773,7 @@ impl DirBuffer {
         DirBuffer {
             req,
             capacity: size,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(size),
             format: DirBufferFormat::Plain,
         }
     }
@@ -775,7 +804,7 @@ impl DirBuffer {
         DirBuffer {
             req,
             capacity: size,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(size),
             format: DirBufferFormat::PlusFallback,
         }
     }
@@ -882,7 +911,7 @@ impl DirPlusBuffer {
         DirPlusBuffer {
             req,
             capacity: size,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(size),
         }
     }
 

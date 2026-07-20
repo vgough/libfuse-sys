@@ -18,5 +18,5 @@ pub use filesystem::Filesystem;
 pub use session::{Error, MountOption, Session};
 pub use types::{
     AccessMode, ConnInfo, DirBuffer, DirPlusBuffer, Entry, Errno, FileAttr, FileInfo, FileType,
-    Inode, OpenReply, Request, SetAttrs, StatFs, TimeOrNow, ROOT_INODE,
+    Inode, OpenReply, Request, SetAttrs, StatFs, TimeOrNow, XattrReply, ROOT_INODE,
 };

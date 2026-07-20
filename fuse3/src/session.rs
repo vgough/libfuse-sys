@@ -12,13 +12,15 @@
 //!
 //! # Panics
 //!
-//! Every shim that can reply with an error wraps its call into the
-//! [`Filesystem`] trait in [`catch_unwind`]; a panicking filesystem method
+//! Every shim that can reply with an error reaches the [`Filesystem`]
+//! trait through [`call_fs`], which wraps the call in [`catch_unwind`]; a
+//! panicking filesystem method
 //! results in `EIO` being sent back to the kernel instead of unwinding
 //! across the `extern "C"` boundary (which is undefined behavior). `forget`
 //! and `forget_multi` have no error reply available in the FUSE protocol
 //! (only `fuse_reply_none`), so a panic there is caught, logged to stderr,
-//! and swallowed.
+//! and swallowed; for `forget_multi` the rest of the batch is skipped, since
+//! the filesystem may be in an inconsistent state after the panic.
 //!
 //! # Darwin symbol aliasing
 //!
@@ -72,7 +74,7 @@ use crate::darwin::{
 };
 
 use crate::filesystem::Filesystem;
-use crate::types::{ConnInfo, DirBuffer, DirPlusBuffer, Entry, Errno, FileAttr, FileInfo, Request, SetAttrs};
+use crate::types::{ConnInfo, DirBuffer, DirPlusBuffer, Entry, Errno, FileAttr, FileInfo, Request, SetAttrs, XattrReply};
 
 // ---------------------------------------------------------------------
 // Darwin-aliased reply wrappers (see module docs)
@@ -178,6 +180,29 @@ fn catch_unwind_unit(f: impl FnOnce()) {
     }
 }
 
+/// Recovers the filesystem behind `req` and runs `f` against it under
+/// [`catch_unwind`].
+///
+/// This is the single entry point every replying trampoline goes through
+/// to reach the [`Filesystem`]; it exists so the holder recovery (see
+/// [`holder_of`] for the soundness argument) and the panic guard (see the
+/// module docs) can never be paired incorrectly in an individual shim.
+/// The shim keeps only its unique parts: raw argument decoding before the
+/// call, and mapping the `Ok` value to the right `fuse_reply_*` after.
+///
+/// The filesystem reference is handed to `f` at the caller-chosen
+/// lifetime `'a` (ultimately unconstrained, like [`holder_of`]'s) so that
+/// return values borrowing from the filesystem - `read`'s `Cow` - can
+/// flow out through `R`.
+fn call_fs<'a, F: Filesystem + 'a, R>(
+    req: fuse_req_t,
+    f: impl FnOnce(&'a mut F, &Request) -> Result<R, Errno>,
+) -> Result<R, Errno> {
+    let holder = holder_of::<F>(req);
+    let request = Request::new(req);
+    catch_unwind(move || f(&mut holder.fs, &request))
+}
+
 fn reply_err(req: fuse_req_t, errno: Errno) {
     unsafe { fuse_reply_err(req, errno.raw()) };
 }
@@ -208,14 +233,27 @@ fn reply_dir_buf(req: fuse_req_t, data: &[u8]) {
 
 /// Implements the `getxattr`/`listxattr` size-query protocol: a requested
 /// size of zero asks for just the value's length; otherwise the value is
-/// sent if it fits, or `ERANGE` if it doesn't.
-fn reply_xattr_data(req: fuse_req_t, data: &[u8], requested_size: usize) {
-    if requested_size == 0 {
-        unsafe { fuse_reply_xattr(req, data.len()) };
-    } else if data.len() > requested_size {
-        reply_err(req, Errno::ERANGE);
-    } else {
-        unsafe { fuse_reply_buf(req, data.as_ptr() as *const c_char, data.len()) };
+/// sent if it fits, or `ERANGE` if it doesn't. `XattrReply::Size` answers
+/// a data request with `EIO` (the wrapper has no data to send, and
+/// `ERANGE` would make the kernel retry forever).
+fn reply_xattr(req: fuse_req_t, reply: &XattrReply, requested_size: usize) {
+    match reply {
+        XattrReply::Size(len) => {
+            if requested_size == 0 {
+                unsafe { fuse_reply_xattr(req, *len) };
+            } else {
+                reply_err(req, Errno::EIO);
+            }
+        }
+        XattrReply::Data(data) => {
+            if requested_size == 0 {
+                unsafe { fuse_reply_xattr(req, data.len()) };
+            } else if data.len() > requested_size {
+                reply_err(req, Errno::ERANGE);
+            } else {
+                unsafe { fuse_reply_buf(req, data.as_ptr() as *const c_char, data.len()) };
+            }
+        }
     }
 }
 
@@ -240,9 +278,7 @@ unsafe extern "C" fn lookup_shim<F: Filesystem>(
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.lookup(&request, parent, name)) {
+    match call_fs::<F, _>(req, |fs, request| fs.lookup(request, parent, name)) {
         Ok(entry) => reply_entry(req, &entry),
         Err(e) => reply_err(req, e),
     }
@@ -261,9 +297,14 @@ unsafe extern "C" fn forget_multi_shim<F: Filesystem>(
 ) {
     let holder = holder_of::<F>(req);
     let entries = unsafe { std::slice::from_raw_parts(forgets, count) };
-    for entry in entries {
-        catch_unwind_unit(|| holder.fs.forget(entry.ino, entry.nlookup));
-    }
+    // One catch_unwind around the whole batch: after a panic the
+    // filesystem may be in an inconsistent state, so the remaining
+    // forgets are dropped rather than invoked on it.
+    catch_unwind_unit(|| {
+        for entry in entries {
+            holder.fs.forget(entry.ino, entry.nlookup);
+        }
+    });
     unsafe { fuse_reply_none(req) };
 }
 
@@ -273,9 +314,7 @@ unsafe extern "C" fn getattr_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let fh = FileInfo::from_raw(fi).map(|f| f.fh);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.getattr(&request, ino, fh)) {
+    match call_fs::<F, _>(req, |fs, request| fs.getattr(request, ino, fh)) {
         Ok((attr, timeout)) => reply_attr(req, &attr, timeout),
         Err(e) => reply_err(req, e),
     }
@@ -291,9 +330,7 @@ fn setattr_shim_impl<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let fh = FileInfo::from_raw(fi).map(|f| f.fh);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.setattr(&request, ino, attrs, fh)) {
+    match call_fs::<F, _>(req, |fs, request| fs.setattr(request, ino, attrs, fh)) {
         Ok((attr, timeout)) => reply_attr(req, &attr, timeout),
         Err(e) => reply_err(req, e),
     }
@@ -330,9 +367,7 @@ unsafe extern "C" fn setattr_shim<F: Filesystem>(
 }
 
 unsafe extern "C" fn readlink_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t) {
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.readlink(&request, ino)) {
+    match call_fs::<F, _>(req, |fs, request| fs.readlink(request, ino)) {
         Ok(target) => match CString::new(target) {
             Ok(c) => {
                 unsafe { fuse_reply_readlink(req, c.as_ptr()) };
@@ -351,9 +386,9 @@ unsafe extern "C" fn mknod_shim<F: Filesystem>(
     rdev: dev_t,
 ) {
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.mknod(&request, parent, name, mode as u32, rdev as u32)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.mknod(request, parent, name, mode as u32, rdev as u32)
+    }) {
         Ok(entry) => reply_entry(req, &entry),
         Err(e) => reply_err(req, e),
     }
@@ -366,9 +401,7 @@ unsafe extern "C" fn mkdir_shim<F: Filesystem>(
     mode: mode_t,
 ) {
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.mkdir(&request, parent, name, mode as u32)) {
+    match call_fs::<F, _>(req, |fs, request| fs.mkdir(request, parent, name, mode as u32)) {
         Ok(entry) => reply_entry(req, &entry),
         Err(e) => reply_err(req, e),
     }
@@ -380,9 +413,7 @@ unsafe extern "C" fn unlink_shim<F: Filesystem>(
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.unlink(&request, parent, name)) {
+    match call_fs::<F, _>(req, |fs, request| fs.unlink(request, parent, name)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -394,9 +425,7 @@ unsafe extern "C" fn rmdir_shim<F: Filesystem>(
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.rmdir(&request, parent, name)) {
+    match call_fs::<F, _>(req, |fs, request| fs.rmdir(request, parent, name)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -410,9 +439,7 @@ unsafe extern "C" fn symlink_shim<F: Filesystem>(
 ) {
     let link = try_name!(req, link);
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.symlink(&request, parent, name, link)) {
+    match call_fs::<F, _>(req, |fs, request| fs.symlink(request, parent, name, link)) {
         Ok(entry) => reply_entry(req, &entry),
         Err(e) => reply_err(req, e),
     }
@@ -428,12 +455,8 @@ unsafe extern "C" fn rename_shim<F: Filesystem>(
 ) {
     let name = try_name!(req, name);
     let newname = try_name!(req, newname);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| {
-        holder
-            .fs
-            .rename(&request, parent, name, newparent, newname, flags)
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.rename(request, parent, name, newparent, newname, flags)
     }) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
@@ -447,9 +470,7 @@ unsafe extern "C" fn link_shim<F: Filesystem>(
     newname: *const c_char,
 ) {
     let newname = try_name!(req, newname);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.link(&request, ino, newparent, newname)) {
+    match call_fs::<F, _>(req, |fs, request| fs.link(request, ino, newparent, newname)) {
         Ok(entry) => reply_entry(req, &entry),
         Err(e) => reply_err(req, e),
     }
@@ -461,9 +482,7 @@ unsafe extern "C" fn open_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.open(&request, ino, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| fs.open(request, ino, &file_info)) {
         Ok(reply) => {
             reply.apply(fi);
             unsafe { fuse_reply_open(req, fi as *const fuse_file_info) };
@@ -480,9 +499,9 @@ unsafe extern "C" fn read_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.read(&request, ino, size, off as u64, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.read(request, ino, size, off as u64, &file_info)
+    }) {
         Ok(data) => {
             let len = data.len().min(size);
             unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
@@ -501,9 +520,9 @@ unsafe extern "C" fn write_shim<F: Filesystem>(
 ) {
     let data = unsafe { std::slice::from_raw_parts(buf as *const u8, size) };
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.write(&request, ino, data, off as u64, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.write(request, ino, data, off as u64, &file_info)
+    }) {
         Ok(count) => {
             unsafe { fuse_reply_write(req, count) };
         }
@@ -517,9 +536,7 @@ unsafe extern "C" fn flush_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.flush(&request, ino, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| fs.flush(request, ino, &file_info)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -531,9 +548,7 @@ unsafe extern "C" fn release_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.release(&request, ino, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| fs.release(request, ino, &file_info)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -546,9 +561,7 @@ unsafe extern "C" fn fsync_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.fsync(&request, ino, datasync != 0, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| fs.fsync(request, ino, datasync != 0, &file_info)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -560,9 +573,7 @@ unsafe extern "C" fn opendir_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.opendir(&request, ino, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| fs.opendir(request, ino, &file_info)) {
         Ok(reply) => {
             reply.apply(fi);
             unsafe { fuse_reply_open(req, fi as *const fuse_file_info) };
@@ -580,9 +591,9 @@ unsafe extern "C" fn readdir_shim<F: Filesystem>(
 ) {
     let fh = FileInfo::from_raw(fi).map(|f| f.fh).unwrap_or(0);
     let mut buf = DirBuffer::new(req, size);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.readdir(&request, ino, off as u64, fh, &mut buf)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.readdir(request, ino, off as u64, fh, &mut buf)
+    }) {
         Ok(()) => reply_dir_buf(req, buf.as_slice()),
         Err(e) => reply_err(req, e),
     }
@@ -607,15 +618,17 @@ unsafe extern "C" fn readdirplus_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let fh = FileInfo::from_raw(fi).map(|f| f.fh).unwrap_or(0);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
 
     let mut buf = DirPlusBuffer::new(req, size);
-    match catch_unwind(|| holder.fs.readdirplus(&request, ino, off as u64, fh, &mut buf)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.readdirplus(request, ino, off as u64, fh, &mut buf)
+    }) {
         Ok(()) => reply_dir_buf(req, buf.as_slice()),
         Err(Errno::ENOSYS) => {
             let mut fallback = DirBuffer::new_plus_fallback(req, size);
-            match catch_unwind(|| holder.fs.readdir(&request, ino, off as u64, fh, &mut fallback)) {
+            match call_fs::<F, _>(req, |fs, request| {
+                fs.readdir(request, ino, off as u64, fh, &mut fallback)
+            }) {
                 Ok(()) => reply_dir_buf(req, fallback.as_slice()),
                 Err(e) => reply_err(req, e),
             }
@@ -630,9 +643,7 @@ unsafe extern "C" fn releasedir_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.releasedir(&request, ino, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| fs.releasedir(request, ino, &file_info)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -645,18 +656,16 @@ unsafe extern "C" fn fsyncdir_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.fsyncdir(&request, ino, datasync != 0, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.fsyncdir(request, ino, datasync != 0, &file_info)
+    }) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
 unsafe extern "C" fn statfs_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t) {
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.statfs(&request, ino)) {
+    match call_fs::<F, _>(req, |fs, request| fs.statfs(request, ino)) {
         Ok(stats) => {
             let raw = stats.to_raw();
             raw_reply_statfs(req, &raw);
@@ -675,9 +684,9 @@ fn setxattr_shim_impl<F: Filesystem>(
 ) {
     let name = try_name!(req, name);
     let value = unsafe { std::slice::from_raw_parts(value as *const u8, size) };
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.setxattr(&request, ino, name, value, flags)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.setxattr(request, ino, name, value, flags)
+    }) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -717,10 +726,8 @@ fn getxattr_shim_impl<F: Filesystem>(
     size: usize,
 ) {
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.getxattr(&request, ino, name)) {
-        Ok(data) => reply_xattr_data(req, &data, size),
+    match call_fs::<F, _>(req, |fs, request| fs.getxattr(request, ino, name, size)) {
+        Ok(reply) => reply_xattr(req, &reply, size),
         Err(e) => reply_err(req, e),
     }
 }
@@ -747,10 +754,8 @@ unsafe extern "C" fn getxattr_shim<F: Filesystem>(
 }
 
 unsafe extern "C" fn listxattr_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t, size: usize) {
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.listxattr(&request, ino)) {
-        Ok(data) => reply_xattr_data(req, &data, size),
+    match call_fs::<F, _>(req, |fs, request| fs.listxattr(request, ino, size)) {
+        Ok(reply) => reply_xattr(req, &reply, size),
         Err(e) => reply_err(req, e),
     }
 }
@@ -761,18 +766,14 @@ unsafe extern "C" fn removexattr_shim<F: Filesystem>(
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.removexattr(&request, ino, name)) {
+    match call_fs::<F, _>(req, |fs, request| fs.removexattr(request, ino, name)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
 unsafe extern "C" fn access_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t, mask: c_int) {
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.access(&request, ino, mask)) {
+    match call_fs::<F, _>(req, |fs, request| fs.access(request, ino, mask)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -787,9 +788,9 @@ unsafe extern "C" fn create_shim<F: Filesystem>(
 ) {
     let name = try_name!(req, name);
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.create(&request, parent, name, mode as u32, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.create(request, parent, name, mode as u32, &file_info)
+    }) {
         Ok((entry, reply)) => {
             reply.apply(fi);
             let param = entry.to_entry_param();
@@ -808,12 +809,8 @@ unsafe extern "C" fn fallocate_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| {
-        holder
-            .fs
-            .fallocate(&request, ino, mode, offset as u64, length as u64, &file_info)
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.fallocate(request, ino, mode, offset as u64, length as u64, &file_info)
     }) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
@@ -828,9 +825,9 @@ unsafe extern "C" fn lseek_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| holder.fs.lseek(&request, ino, off as u64, whence, &file_info)) {
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.lseek(request, ino, off as u64, whence, &file_info)
+    }) {
         Ok(new_off) => {
             unsafe { fuse_reply_lseek(req, new_off as off_t) };
         }
@@ -852,11 +849,9 @@ unsafe extern "C" fn copy_file_range_shim<F: Filesystem>(
 ) {
     let file_info_in = FileInfo::from_raw(fi_in).unwrap_or_default();
     let file_info_out = FileInfo::from_raw(fi_out).unwrap_or_default();
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    match catch_unwind(|| {
-        holder.fs.copy_file_range(
-            &request,
+    match call_fs::<F, _>(req, |fs, request| {
+        fs.copy_file_range(
+            request,
             ino_in,
             off_in as u64,
             &file_info_in,

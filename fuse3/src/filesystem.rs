@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::types::{
     ConnInfo, DirBuffer, DirPlusBuffer, Entry, Errno, FileAttr, FileInfo, Inode, OpenReply,
-    Request, SetAttrs, StatFs,
+    Request, SetAttrs, StatFs, XattrReply,
 };
 
 /// The safe, low-level FUSE filesystem interface.
@@ -151,6 +151,21 @@ pub trait Filesystem {
     /// Reads up to `size` bytes from `ino` at `offset`. The returned
     /// [`Cow`] is truncated to `size` by the caller before being sent, so
     /// implementations may over-return trailing data.
+    ///
+    /// The `Cow`'s lifetime is tied to `&mut self`, so filesystems that
+    /// already hold the data in memory (a cache, an mmap, a generated
+    /// file) can reply without copying or allocating by borrowing from
+    /// their own storage:
+    ///
+    /// ```ignore
+    /// fn read(&mut self, ..., offset: u64, ...) -> Result<Cow<'_, [u8]>, Errno> {
+    ///     let data = &self.contents[offset as usize..];
+    ///     Ok(Cow::Borrowed(data)) // no allocation; sent directly
+    /// }
+    /// ```
+    ///
+    /// `Cow::Owned` is only needed when the data has to be materialized
+    /// per-request (e.g. `pread` into a fresh buffer).
     fn read(
         &mut self,
         req: &Request,
@@ -277,18 +292,28 @@ pub trait Filesystem {
         Err(Errno::ENOSYS)
     }
 
-    /// Returns the value of the extended attribute `name` on `ino`. The
-    /// wrapper automatically implements the libfuse size-query protocol
-    /// (an incoming `size` of zero asks for the value's length only) using
-    /// the length of the returned `Vec`.
-    fn getxattr(&mut self, req: &Request, ino: Inode, name: &str) -> Result<Vec<u8>, Errno> {
+    /// Returns the value of the extended attribute `name` on `ino`.
+    ///
+    /// `size` is the caller's buffer size. A `size` of zero is a size
+    /// query: the kernel only wants the value's length, so return
+    /// [`XattrReply::Size`] and skip materializing the data (returning
+    /// [`XattrReply::Data`] is also accepted; only its length is sent).
+    /// For a non-zero `size`, return [`XattrReply::Data`]; the wrapper
+    /// replies `ERANGE` if it does not fit in `size`.
+    fn getxattr(
+        &mut self,
+        req: &Request,
+        ino: Inode,
+        name: &str,
+        size: usize,
+    ) -> Result<XattrReply, Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Returns the NUL-separated list of extended attribute names on
     /// `ino`, in the raw `listxattr(2)` wire format. Same size-query
     /// protocol as [`Filesystem::getxattr`].
-    fn listxattr(&mut self, req: &Request, ino: Inode) -> Result<Vec<u8>, Errno> {
+    fn listxattr(&mut self, req: &Request, ino: Inode, size: usize) -> Result<XattrReply, Errno> {
         Err(Errno::ENOSYS)
     }
 
