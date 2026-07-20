@@ -21,7 +21,22 @@ pub mod fuse {
         op: *const fuse_operations,
         user_data: *mut c_void,
     ) -> c_int {
-        fuse_main_real(argc, argv, op, std::mem::size_of_val(&*op), user_data)
+        let mut version = libfuse_version {
+            major: FUSE_MAJOR_VERSION as _,
+            minor: FUSE_MINOR_VERSION as _,
+            hotfix: FUSE_HOTFIX_VERSION as _,
+            ..Default::default()
+        };
+        #[cfg(target_os = "macos")]
+        version.set_darwin_extensions_enabled(FUSE_DARWIN_ENABLE_EXTENSIONS as _);
+        fuse_main_real_versioned(
+            argc,
+            argv,
+            op,
+            std::mem::size_of_val(&*op),
+            &mut version,
+            user_data,
+        )
     }
 }
 
@@ -34,8 +49,5 @@ pub mod fuse_lowlevel {
 #[cfg(feature = "cuse_lowlevel")]
 pub mod cuse_lowlevel {
     use super::*;
-    use fuse_lowlevel::{
-        fuse_args, fuse_conn_info, fuse_file_info, fuse_pollhandle, fuse_req_t, fuse_session,
-    };
     include!(concat!(env!("OUT_DIR"), "/cuse_lowlevel.rs"));
 }

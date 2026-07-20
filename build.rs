@@ -5,7 +5,7 @@ use std::env;
 use std::iter;
 use std::path::PathBuf;
 
-const FUSE_DEFAULT_API_VERSION: u32 = 30;
+const FUSE_DEFAULT_API_VERSION: u32 = 35;
 
 macro_rules! version {
     ($version_var:ident, $feature:literal, $version:literal) => {
@@ -22,10 +22,9 @@ macro_rules! version {
 fn fuse_binding_filter(builder: bindgen::Builder) -> bindgen::Builder {
     let mut builder = builder
         // Whitelist "fuse_*" symbols and blocklist everything else
-        .allowlist_recursively(false)
-        .allowlist_type("(?i)^fuse.*")
-        .allowlist_function("(?i)^fuse.*")
-        .allowlist_var("(?i)^fuse.*")
+        .allowlist_type("^[fF][uU][sS][eE].*")
+        .allowlist_function("^[fF][uU][sS][eE].*")
+        .allowlist_var("^[fF][uU][sS][eE].*")
         .blocklist_type("fuse_log_func_t")
         .blocklist_function("fuse_set_log_func");
     // TODO: properly bind fuse_log_func_t and allowlist fuse_set_log_func again
@@ -40,10 +39,9 @@ fn fuse_binding_filter(builder: bindgen::Builder) -> bindgen::Builder {
 fn cuse_binding_filter(builder: bindgen::Builder) -> bindgen::Builder {
     builder
         // Whitelist "cuse_*" symbols and blocklist everything else
-        .allowlist_recursively(false)
-        .allowlist_type("(?i)^cuse.*")
-        .allowlist_function("(?i)^cuse.*")
-        .allowlist_var("(?i)^cuse.*")
+        .allowlist_type("^[cC][uU][sS][eE].*")
+        .allowlist_function("^[cC][uU][sS][eE].*")
+        .allowlist_var("^[cC][uU][sS][eE].*")
 }
 
 fn generate_fuse_bindings(
@@ -91,7 +89,7 @@ fn generate_fuse_bindings(
         .derive_copy(true)
         .derive_debug(true)
         // Add CargoCallbacks so build.rs is rerun on header changes
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks));
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
 
     builder = binding_filter(builder);
 
