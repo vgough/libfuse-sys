@@ -18,14 +18,6 @@ libfuse-sys = { version = "*", features = ["fuse_35"] }
 libc = "*"
 ```
 You can select other API versions for fuse. Currently supported are
-* `fuse_11`
-* `fuse_21`
-* `fuse_22`
-* `fuse_24`
-* `fuse_25`
-* `fuse_26`
-* `fuse_29`
-* `fuse_30`
 * `fuse_31`
 * `fuse_35`
 
@@ -35,7 +27,7 @@ If no version is selected the crate defaults to version 35.
 
 `examples/hello_ll.rs` is a Rust port of libfuse's classic `hello_ll.c`: a read-only
 filesystem exposing a single file, `hello`, containing "Hello World!\n". It uses the
-lowlevel FUSE 3.x API, so it requires building without a FUSE 2.x version feature.
+lowlevel FUSE 3.x API.
 
 ```sh
 mkdir /tmp/hello_mnt

@@ -113,14 +113,6 @@ fn main() {
     // Get the API version and panic if more than one is declared
     #[allow(unused_mut)]
     let mut api_version: Option<u32> = None;
-    version!(api_version, "fuse_11", 11);
-    version!(api_version, "fuse_21", 21);
-    version!(api_version, "fuse_22", 22);
-    version!(api_version, "fuse_24", 24);
-    version!(api_version, "fuse_25", 25);
-    version!(api_version, "fuse_26", 26);
-    version!(api_version, "fuse_29", 29);
-    version!(api_version, "fuse_30", 30);
     version!(api_version, "fuse_31", 31);
     version!(api_version, "fuse_35", 35);
     // Warn if no API version is selected
@@ -136,27 +128,8 @@ fn main() {
     let mut pkgcfg = pkg_config::Config::new();
     pkgcfg.cargo_metadata(false);
 
-    // Find libfuse
-    let try_fuse_lib = pkgcfg.probe("fuse");
-    let try_fuse3_lib = pkgcfg.probe("fuse3");
-    let fuse_lib = match (try_fuse_lib, try_fuse3_lib) {
-        (Err(err), Err(err3)) => panic!(
-            "Failed to find pkg-config modules fuse ({}) or fuse3 ({})",
-            err, err3
-        ),
-        (Ok(_), Err(_)) => "fuse",
-        (Err(_), Ok(_)) => "fuse3",
-        (Ok(_), Ok(_)) => {
-            // Strange situation but we should just try to find the module that is more likely
-            // to be the correct one here.
-            if api_version < 30 {
-                "fuse"
-            } else {
-                "fuse3"
-            }
-        }
-    };
-    let fuse_lib = pkgcfg.cargo_metadata(true).probe(fuse_lib).unwrap();
+    // FUSE 3.1 and later use the fuse3 pkg-config module.
+    let fuse_lib = pkgcfg.cargo_metadata(true).probe("fuse3").unwrap();
 
     // Generate highlevel bindings
     #[cfg(feature = "fuse_highlevel")]

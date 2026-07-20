@@ -4,17 +4,6 @@
 //!
 //! Usage: `cargo run --example hello_ll -- <mountpoint>`
 
-// This example uses the lowlevel FUSE 3.x API (fuse_session_*, fuse_cmdline_opts, ...)
-// which is not available when one of the FUSE 2.x API version features is selected.
-#[cfg(not(any(
-    feature = "fuse_11",
-    feature = "fuse_21",
-    feature = "fuse_22",
-    feature = "fuse_24",
-    feature = "fuse_25",
-    feature = "fuse_26",
-    feature = "fuse_29",
-)))]
 mod imp {
     use libfuse_sys::fuse_lowlevel::*;
     use std::ffi::{CStr, CString};
@@ -282,32 +271,6 @@ mod imp {
     }
 }
 
-#[cfg(not(any(
-    feature = "fuse_11",
-    feature = "fuse_21",
-    feature = "fuse_22",
-    feature = "fuse_24",
-    feature = "fuse_25",
-    feature = "fuse_26",
-    feature = "fuse_29",
-)))]
 fn main() {
     std::process::exit(imp::run());
-}
-
-#[cfg(any(
-    feature = "fuse_11",
-    feature = "fuse_21",
-    feature = "fuse_22",
-    feature = "fuse_24",
-    feature = "fuse_25",
-    feature = "fuse_26",
-    feature = "fuse_29",
-))]
-fn main() {
-    eprintln!(
-        "hello_ll example requires the FUSE 3.x lowlevel API; \
-         build without a FUSE 2.x version feature (e.g. `--features fuse_35`)"
-    );
-    std::process::exit(1);
 }
