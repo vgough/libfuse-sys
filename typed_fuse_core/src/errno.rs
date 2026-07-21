@@ -19,7 +19,11 @@ impl Errno {
     pub const ERANGE: Errno = Errno(libc::ERANGE);
     /// "No data available" - used for missing extended attributes.
     pub const ENODATA: Errno = Errno(libc::ENODATA);
-    /// Alias of [`Errno::ENODATA`] (the BSD/macOS name for the same error).
+    /// The error used for missing extended attributes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const ENOATTR: Errno = Errno(libc::ENODATA);
+    /// The error used for missing extended attributes.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub const ENOATTR: Errno = Errno(libc::ENOATTR);
     pub const EILSEQ: Errno = Errno(libc::EILSEQ);
     pub const ENOSPC: Errno = Errno(libc::ENOSPC);
