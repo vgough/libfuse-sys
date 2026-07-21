@@ -96,6 +96,41 @@ cat /tmp/hello_mnt/hello
 Unmount it with `umount /tmp/hello_mnt` on macOS or `fusermount3 -u /tmp/hello_mnt` on
 Linux.
 
+## Filesystem benchmark
+
+The workspace includes an automated filesystem benchmark based on `mdtest`,
+distributed as part of IOR. It mounts the release build of the `memory_fs`
+example, runs mdtest's standard directory and file phases on that filesystem,
+unmounts it, and removes its temporary mount directory. It requires a working
+FUSE installation, `mdtest` on `PATH` (or `MDTEST_BIN`), and `mpirun` only for
+multi-rank runs.
+
+Save a baseline for the current machine, then compare later runs with it:
+
+```sh
+make benchmark-save-baseline
+make benchmark
+```
+
+The default workload uses one rank, 1,000 items per iteration, five iterations,
+and 4,096-byte writes and reads. Results are mean operations per second for each
+operation in mdtest's summary. Deltas are informational; command, parse, mount,
+and unmount failures still fail the benchmark.
+
+The workload and tools can be customized with `BENCH_BASELINE`, `BENCH_ITEMS`,
+`BENCH_ITERATIONS`, `BENCH_PROCS`, `BENCH_BYTES`, `MDTEST_BIN`, `MPIRUN_BIN`,
+and `BENCH_MOUNT_TIMEOUT_SECS`. For example:
+
+```sh
+make benchmark-save-baseline BENCH_ITEMS=100 BENCH_ITERATIONS=2
+make benchmark BENCH_ITEMS=100 BENCH_ITERATIONS=2
+make benchmark BENCH_PROCS=4 MPIRUN_BIN=/opt/mpi/bin/mpirun
+```
+
+The default baseline is `.benchmarks/filesystem-baseline.json`, which is ignored
+by Git. Baselines are machine-specific, and comparisons warn when host context
+or the mdtest version differs.
+
 ## License
 
 This crate itself is published under the MIT license while libfuse is published under

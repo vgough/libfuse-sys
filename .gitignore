@@ -1,4 +1,5 @@
 /target
+/fuse3/.benchmarks
 **/*.rs.bk
 Cargo.lock
 *.swp

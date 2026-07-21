@@ -7,3 +7,15 @@ edition = "2021"
 libfuse-sys = { path = "..", default-features = false, features = ["fuse_lowlevel"] }
 typed_fuse_core = { path = "../typed_fuse_core" }
 libc = "0.2"
+
+[dev-dependencies]
+anyhow = "1"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+tempfile = "3"
+
+[[bench]]
+name = "filesystem"
+harness = false
