@@ -2,10 +2,57 @@ extern crate bindgen;
 extern crate pkg_config;
 
 use std::env;
+use std::ffi::OsString;
 use std::iter;
 use std::path::PathBuf;
+use std::process::Command;
 
 const FUSE_DEFAULT_API_VERSION: u32 = 35;
+
+fn clang_resource_include_path() -> Option<PathBuf> {
+    let clang = env::var_os("CLANG_PATH").unwrap_or_else(|| "clang".into());
+    let output = Command::new(clang)
+        .arg("-print-resource-dir")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let resource_dir = String::from_utf8(output.stdout).ok()?;
+    let include_path = PathBuf::from(resource_dir.trim()).join("include");
+    include_path
+        .join("stdarg.h")
+        .is_file()
+        .then_some(include_path)
+}
+
+fn compiler_include_path(compiler: OsString) -> Option<PathBuf> {
+    let output = Command::new(compiler)
+        .arg("-print-file-name=include")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let include_path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    include_path
+        .join("stdarg.h")
+        .is_file()
+        .then_some(include_path)
+}
+
+fn builtin_header_include_path() -> Option<PathBuf> {
+    clang_resource_include_path().or_else(|| {
+        env::var_os("CC")
+            .into_iter()
+            .chain([OsString::from("cc"), OsString::from("gcc")])
+            .find_map(compiler_include_path)
+    })
+}
 
 macro_rules! version {
     ($version_var:ident, $feature:literal, $version:literal) => {
@@ -79,8 +126,17 @@ fn generate_fuse_bindings(
         .map(|dir| format!("-I{}", dir.display()));
     // API version definition
     let api_define = iter::once(format!("-DFUSE_USE_VERSION={}", api_version));
+    // Compiler-provided headers such as stdarg.h live in a Clang or GCC
+    // internal include directory, not /usr/include. Some libclang
+    // installations fail to add this directory to their default search path.
+    let builtin_header_include = builtin_header_include_path()
+        .into_iter()
+        .flat_map(|dir| ["-isystem".to_string(), dir.display().to_string()]);
     // Chain compile flags
-    let compile_flags = defines.chain(includes).chain(api_define);
+    let compile_flags = defines
+        .chain(includes)
+        .chain(api_define)
+        .chain(builtin_header_include);
 
     // Create bindgen builder
     let mut builder = bindgen::builder()
@@ -110,6 +166,9 @@ fn generate_fuse_bindings(
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CLANG_PATH");
+    println!("cargo:rerun-if-env-changed=CC");
+
     // Get the API version and panic if more than one is declared
     #[allow(unused_mut)]
     let mut api_version: Option<u32> = None;

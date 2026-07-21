@@ -121,12 +121,12 @@ pub(crate) fn attr_to_stat(ino: u64, attr: &NodeAttr) -> stat {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        st.st_atime = atime_sec as _;
-        st.st_atime_nsec = atime_nsec as _;
-        st.st_mtime = mtime_sec as _;
-        st.st_mtime_nsec = mtime_nsec as _;
-        st.st_ctime = ctime_sec as _;
-        st.st_ctime_nsec = ctime_nsec as _;
+        st.st_atim.tv_sec = atime_sec as _;
+        st.st_atim.tv_nsec = atime_nsec as _;
+        st.st_mtim.tv_sec = mtime_sec as _;
+        st.st_mtim.tv_nsec = mtime_nsec as _;
+        st.st_ctim.tv_sec = ctime_sec as _;
+        st.st_ctim.tv_nsec = ctime_nsec as _;
         // crtime/flags have no vanilla `stat` field on Linux.
     }
 
@@ -225,22 +225,22 @@ pub(crate) fn setattr_from_raw(attr: *const stat, to_set: c_int) -> SetAttr {
             out.atime = Some(TimeOrNow::Now);
         } else if to_set & FUSE_SET_ATTR_ATIME != 0 {
             out.atime = Some(TimeOrNow::SpecificTime(secs_nsecs_to_system_time(
-                st.st_atime as i64,
-                st.st_atime_nsec as i64,
+                st.st_atim.tv_sec as i64,
+                st.st_atim.tv_nsec as i64,
             )));
         }
         if to_set & FUSE_SET_ATTR_MTIME_NOW != 0 {
             out.mtime = Some(TimeOrNow::Now);
         } else if to_set & FUSE_SET_ATTR_MTIME != 0 {
             out.mtime = Some(TimeOrNow::SpecificTime(secs_nsecs_to_system_time(
-                st.st_mtime as i64,
-                st.st_mtime_nsec as i64,
+                st.st_mtim.tv_sec as i64,
+                st.st_mtim.tv_nsec as i64,
             )));
         }
         if to_set & FUSE_SET_ATTR_CTIME != 0 {
             out.ctime = Some(secs_nsecs_to_system_time(
-                st.st_ctime as i64,
-                st.st_ctime_nsec as i64,
+                st.st_ctim.tv_sec as i64,
+                st.st_ctim.tv_nsec as i64,
             ));
         }
         // crtime/flags have no vanilla `stat` field on Linux.

@@ -79,12 +79,12 @@ mod imp {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            attr.st_atime = mounted_at.seconds as _;
-            attr.st_atime_nsec = mounted_at.nanoseconds as _;
-            attr.st_mtime = mounted_at.seconds as _;
-            attr.st_mtime_nsec = mounted_at.nanoseconds as _;
-            attr.st_ctime = mounted_at.seconds as _;
-            attr.st_ctime_nsec = mounted_at.nanoseconds as _;
+            attr.st_atim.tv_sec = mounted_at.seconds as _;
+            attr.st_atim.tv_nsec = mounted_at.nanoseconds as _;
+            attr.st_mtim.tv_sec = mounted_at.seconds as _;
+            attr.st_mtim.tv_nsec = mounted_at.nanoseconds as _;
+            attr.st_ctim.tv_sec = mounted_at.seconds as _;
+            attr.st_ctim.tv_nsec = mounted_at.nanoseconds as _;
         }
     }
 
