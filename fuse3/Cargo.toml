@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 libfuse-sys = { path = "..", default-features = false, features = ["fuse_lowlevel"] }
+typed_fuse_core = { path = "../typed_fuse_core" }
 libc = "0.2"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["fuse3"]
+members = ["fuse3", "typed_fuse_core"]
 
 [package]
 name = "libfuse-sys"

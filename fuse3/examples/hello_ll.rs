@@ -1,128 +1,153 @@
-//! Safe-API port of libfuse's classic `hello_ll.c` example (see also the
-//! raw-bindings version at `examples/hello_ll.rs` in the workspace root).
+//! Node-API port of libfuse's classic `hello_ll.c`: a read-only filesystem
+//! with a single file `hello` containing "Hello World!\n".
 //!
-//! A read-only filesystem with a single file `hello` containing
-//! "Hello World!\n". Unlike the raw port, this file needs no manual memory
-//! management, no C types, and no per-OS conditional compilation - it is
-//! written entirely against the safe `fuse3::Filesystem` trait.
+//! Compared to the raw port, this manages no inode numbers, no file handles,
+//! no lifetime, and no C types. The two nodes are seeded in `populate`; the
+//! runtime assigns their inodes and tracks everything else.
 //!
 //! Usage: `cargo run -p fuse3 --example hello_ll -- <mountpoint>`
 
 use std::borrow::Cow;
-use std::time::{Duration, SystemTime};
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use fuse3::{
-    AccessMode, DirBuffer, Entry, Errno, FileAttr, FileInfo, FileType, Filesystem, Inode,
-    OpenReply, Request, Session, ROOT_INODE,
+    Caller, Cx, Errno, FileKind, NodeAttr, NodeFs, NodeId, Opened, Session,
 };
 
-const HELLO_INODE: Inode = 2;
-const HELLO_NAME: &str = "hello";
 const HELLO_CONTENT: &[u8] = b"Hello World!\n";
+
+enum Node {
+    Dir { entries: BTreeMap<String, NodeId> },
+    File { content: &'static [u8] },
+}
 
 struct HelloFs {
     mounted_at: SystemTime,
 }
 
 impl HelloFs {
-    /// Returns the attributes for `ino`, or `None` if it does not exist.
-    fn attr(&self, ino: Inode) -> Option<FileAttr> {
-        let (kind, perm, nlink, size): (FileType, u16, u32, u64) = match ino {
-            ROOT_INODE => (FileType::Directory, 0o755, 2, 0),
-            HELLO_INODE => (FileType::RegularFile, 0o444, 1, HELLO_CONTENT.len() as u64),
-            _ => return None,
+    fn attr_of(&self, node: &Node) -> NodeAttr {
+        let (kind, perm, size, nlink) = match node {
+            Node::Dir { .. } => (FileKind::Directory, 0o755, 0, 2),
+            Node::File { content } => {
+                (FileKind::RegularFile, 0o444, content.len() as u64, 1)
+            }
         };
-        Some(FileAttr {
-            ino,
-            size,
+        NodeAttr {
             kind,
             perm,
+            size,
             nlink,
             atime: self.mounted_at,
             mtime: self.mounted_at,
             ctime: self.mounted_at,
             crtime: self.mounted_at,
             ..Default::default()
-        })
+        }
     }
 }
 
-impl Filesystem for HelloFs {
-    fn lookup(&mut self, _req: &Request, parent: Inode, name: &str) -> Result<Entry, Errno> {
-        if parent != ROOT_INODE || name != HELLO_NAME {
-            return Err(Errno::ENOENT);
+impl NodeFs for HelloFs {
+    type Node = Node;
+    type Handle = ();
+    type DirHandle = ();
+
+    fn root(&mut self) -> Node {
+        Node::Dir {
+            entries: BTreeMap::new(),
         }
-        let attr = self.attr(HELLO_INODE).ok_or(Errno::ENOENT)?;
-        Ok(Entry {
-            ino: HELLO_INODE,
-            attr,
-            attr_timeout: Duration::from_secs(1),
-            entry_timeout: Duration::from_secs(1),
-            ..Default::default()
-        })
     }
 
-    fn getattr(
+    fn populate(&mut self, cx: &mut Cx<'_, Node>) {
+        let hello = cx.insert(
+            Node::File {
+                content: HELLO_CONTENT,
+            },
+            NodeId::ROOT,
+        );
+        if let Some(Node::Dir { entries }) = cx.get_mut(NodeId::ROOT) {
+            entries.insert("hello".to_string(), hello);
+        }
+    }
+
+    fn getattr(&mut self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
+        Ok(self.attr_of(node))
+    }
+
+    fn lookup(
         &mut self,
-        _req: &Request,
-        ino: Inode,
-        _fh: Option<u64>,
-    ) -> Result<(FileAttr, Duration), Errno> {
-        self.attr(ino)
-            .map(|attr| (attr, Duration::from_secs(1)))
-            .ok_or(Errno::ENOENT)
+        cx: &mut Cx<'_, Node>,
+        parent: NodeId,
+        name: &str,
+        _c: &Caller,
+    ) -> Result<Option<NodeId>, Errno> {
+        match cx.get(parent) {
+            Some(Node::Dir { entries }) => Ok(entries.get(name).copied()),
+            Some(_) => Err(Errno::ENOTDIR),
+            None => Err(Errno::ENOENT),
+        }
     }
 
-    fn open(&mut self, _req: &Request, ino: Inode, fi: &FileInfo) -> Result<OpenReply, Errno> {
-        if ino != HELLO_INODE {
-            return Err(Errno::EISDIR);
+    fn open(&mut self, node: &mut Node, _flags: i32, _c: &Caller) -> Result<Opened<()>, Errno> {
+        match node {
+            Node::File { .. } => Ok(Opened::new(())),
+            Node::Dir { .. } => Err(Errno::EISDIR),
         }
-        if fi.access_mode() != AccessMode::ReadOnly {
-            return Err(Errno::EACCES);
-        }
-        Ok(OpenReply::new(0))
     }
 
-    fn read(
-        &mut self,
-        _req: &Request,
-        ino: Inode,
-        size: usize,
+    fn read<'a>(
+        &'a mut self,
+        node: &'a mut Node,
+        _h: &'a mut (),
         offset: u64,
-        _fi: &FileInfo,
-    ) -> Result<Cow<'_, [u8]>, Errno> {
-        if ino != HELLO_INODE {
-            return Err(Errno::EIO);
-        }
+        size: usize,
+        _c: &Caller,
+    ) -> Result<Cow<'a, [u8]>, Errno> {
+        let Node::File { content } = node else {
+            return Err(Errno::EISDIR);
+        };
         let offset = offset as usize;
-        if offset >= HELLO_CONTENT.len() {
+        if offset >= content.len() {
             return Ok(Cow::Borrowed(&[]));
         }
-        let end = (offset + size).min(HELLO_CONTENT.len());
-        Ok(Cow::Borrowed(&HELLO_CONTENT[offset..end]))
+        let end = (offset + size).min(content.len());
+        Ok(Cow::Borrowed(&content[offset..end]))
     }
 
     fn readdir(
         &mut self,
-        _req: &Request,
-        ino: Inode,
+        node: &Node,
+        this: NodeId,
+        parent: NodeId,
+        _dh: &mut (),
         offset: u64,
-        _fh: u64,
-        buf: &mut DirBuffer,
+        sink: &mut dyn fuse3::DirSink,
+        _c: &Caller,
     ) -> Result<(), Errno> {
-        if ino != ROOT_INODE {
+        let Node::Dir { entries } = node else {
             return Err(Errno::ENOTDIR);
+        };
+
+        // Offsets: 1 => ".", 2 => "..", 3.. => real entries.
+        let mut cursor = offset;
+        if cursor < 1 {
+            if !sink.add(".", this, FileKind::Directory, 1) {
+                return Ok(());
+            }
+            cursor = 1;
+        }
+        if cursor < 2 {
+            if !sink.add("..", parent, FileKind::Directory, 2) {
+                return Ok(());
+            }
+            cursor = 2;
         }
 
-        let entries: [(&str, Inode, FileType); 3] = [
-            (".", ROOT_INODE, FileType::Directory),
-            ("..", ROOT_INODE, FileType::Directory),
-            (HELLO_NAME, HELLO_INODE, FileType::RegularFile),
-        ];
-
-        for (index, (name, ino, kind)) in entries.iter().enumerate().skip(offset as usize) {
-            let next_offset = index as u64 + 1;
-            if !buf.add(name, *ino, *kind, next_offset) {
+        let skip = (cursor - 2) as usize;
+        for (i, (name, &id)) in entries.iter().enumerate().skip(skip) {
+            let next_offset = (i + 3) as u64;
+            if !sink.add(name, id, FileKind::RegularFile, next_offset) {
                 break;
             }
         }

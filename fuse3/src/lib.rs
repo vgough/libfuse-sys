@@ -1,22 +1,30 @@
-//! A safe, Rust-friendly wrapper over the raw low-level FUSE bindings in
+//! A safe, node-based FUSE wrapper over the raw low-level bindings in
 //! `libfuse_sys::fuse_lowlevel`.
 //!
-//! Filesystem authors using this crate write zero `unsafe`, zero C types,
-//! and zero `target_os` cfgs - all of that is centralized here.
+//! Filesystem authors implement the [`NodeFs`] trait (re-exported from
+//! [`typed_fuse_core`]) against their own node and handle types, and drive it
+//! with [`Session`]. The base layer owns inode identity, node lifetime
+//! (lookup/link/open refcounts and deferred deletion), and file handles, so
+//! filesystems never manage inode numbers or integer file handles
+//! themselves.
 //!
-//! Implement [`Filesystem`] and drive it with [`Session`] (or the
-//! [`Session::mount_and_run`] convenience function).
+//! This crate is the FFI bridge: it decodes raw C callbacks into the
+//! backend-neutral types of `typed_fuse_core`, drives the
+//! [`Runtime`](typed_fuse_core::Runtime), and encodes results back into
+//! `fuse_reply_*`. All per-OS layout handling lives in the `conv` module;
+//! all `unsafe` lives here.
 
-mod filesystem;
+mod conv;
+mod ffi;
 mod session;
-mod types;
 
 #[cfg(target_os = "macos")]
 mod darwin;
 
-pub use filesystem::Filesystem;
 pub use session::{Error, MountOption, Session};
-pub use types::{
-    AccessMode, ConnInfo, DirBuffer, DirPlusBuffer, Entry, Errno, FileAttr, FileInfo, FileType,
-    Inode, OpenReply, Request, SetAttrs, StatFs, TimeOrNow, XattrReply, ROOT_INODE,
+
+// The user-facing API is the node-based core.
+pub use typed_fuse_core::{
+    Caller, ConnInfo, Cx, DirSink, Errno, FileKind, NodeAttr, NodeFs, NodeId, OpenHints, Opened,
+    SetAttr, StatFs, TimeOrNow, XattrReply,
 };

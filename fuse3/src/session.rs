@@ -1,48 +1,32 @@
-//! Trampolines from the raw `fuse_lowlevel_ops` C callback table to a safe
-//! [`Filesystem`] implementation, plus the [`Session`] type that owns a
-//! mounted FUSE session end to end.
+//! Trampolines from the raw `fuse_lowlevel_ops` C callback table to a
+//! [`Runtime`] driving a [`NodeFs`] implementation, plus the [`Session`]
+//! type that owns a mounted FUSE session end to end.
 //!
 //! # Threading
 //!
-//! `fuse_session_loop` (used by [`Session::run`]) processes requests
-//! strictly one at a time, so at most one trampoline below is ever
-//! executing for a given [`Filesystem`] instance. That is what makes it
-//! sound to recover a `&mut FsHolder<F>` from the raw `userdata`/`req`
-//! pointer in every shim.
+//! `fuse_session_loop` (used by [`Session::run`]) processes requests strictly
+//! one at a time, so at most one trampoline is ever executing for a given
+//! runtime. That is what makes it sound to recover a `&mut Runtime<F>` from
+//! the raw `userdata`/`req` pointer in every shim.
 //!
 //! # Panics
 //!
-//! Every shim that can reply with an error reaches the [`Filesystem`]
-//! trait through [`call_fs`], which wraps the call in [`catch_unwind`]; a
-//! panicking filesystem method
-//! results in `EIO` being sent back to the kernel instead of unwinding
-//! across the `extern "C"` boundary (which is undefined behavior). `forget`
-//! and `forget_multi` have no error reply available in the FUSE protocol
-//! (only `fuse_reply_none`), so a panic there is caught, logged to stderr,
-//! and swallowed; for `forget_multi` the rest of the batch is skipped, since
-//! the filesystem may be in an inconsistent state after the panic.
+//! Every replying shim reaches the runtime through [`call_fs`], which wraps
+//! the call in [`catch_unwind`]; a panicking filesystem method results in
+//! `EIO` being sent to the kernel instead of unwinding across the
+//! `extern "C"` boundary (undefined behavior). `forget`/`forget_multi` have
+//! no error reply, so a panic there is caught, logged, and swallowed.
 //!
 //! # Darwin symbol aliasing
 //!
-//! See `darwin.rs` for the macOS-only workaround this module relies on:
-//! `fuse_reply_entry`, `fuse_reply_attr`, `fuse_reply_create`,
-//! `fuse_reply_statfs`, `fuse_add_direntry` and `fuse_add_direntry_plus` are
-//! aliased to `<name>$DARWIN` symbols in the headers that do not exist in
-//! the installed dylib; this module always goes through the small
-//! `raw_reply_*` wrappers below (cfg'd per platform) instead of calling the
-//! bindgen declarations directly, so the rest of this file stays
-//! `#[cfg]`-free.
-//!
-//! # Darwin-extended callback argument types
-//!
-//! `Filesystem::setattr`'s underlying `fuse_lowlevel_ops::setattr` field is
-//! typed `*mut fuse_darwin_attr` by bindgen on macOS (the header was parsed
-//! with Darwin extensions enabled by default). Since this crate always
-//! disables Darwin extensions at the session level
-//! (`set_darwin_extensions_enabled(0)`, see [`Session::new`]), libfuse
-//! actually invokes the callback with a vanilla `struct stat*` at runtime;
-//! `setattr_shim` reinterprets the pointer accordingly (see the safety
-//! comment on that function). No other op's callback signature is affected.
+//! See `darwin.rs`: on macOS `fuse_reply_entry`/`_attr`/`_create`/`_statfs`
+//! and the direntry builders are aliased to non-existent `<name>$DARWIN`
+//! symbols. This module (and `ffi.rs`) always go through the cfg'd
+//! `raw_reply_*`/`raw_add_direntry*` wrappers so the rest of the code stays
+//! `#[cfg]`-free. `setattr`'s callback is typed `*mut fuse_darwin_attr` by
+//! bindgen on macOS; since Darwin extensions are disabled at the session
+//! level, libfuse actually passes a vanilla `stat*`, which `setattr_shim`
+//! reinterprets.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
@@ -51,11 +35,11 @@ use std::ptr;
 use std::time::Duration;
 
 use libfuse_sys::fuse_lowlevel::{
-    dev_t, fuse_args, fuse_conn_info, fuse_entry_param, fuse_file_info, fuse_forget_data,
+    dev_t, fuse_args, fuse_conn_info, fuse_ctx, fuse_entry_param, fuse_file_info, fuse_forget_data,
     fuse_ino_t, fuse_lowlevel_ops, fuse_opt_free_args, fuse_remove_signal_handlers,
     fuse_reply_buf, fuse_reply_err, fuse_reply_lseek, fuse_reply_none, fuse_reply_open,
-    fuse_reply_readlink, fuse_reply_write, fuse_reply_xattr, fuse_req_t, fuse_req_userdata,
-    fuse_session, fuse_session_destroy, fuse_session_loop, fuse_session_mount,
+    fuse_reply_readlink, fuse_reply_write, fuse_reply_xattr, fuse_req_ctx, fuse_req_t,
+    fuse_req_userdata, fuse_session, fuse_session_destroy, fuse_session_loop, fuse_session_mount,
     fuse_session_new_versioned, fuse_session_unmount, fuse_set_signal_handlers, libfuse_version,
     mode_t, off_t, stat, FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION,
 };
@@ -73,11 +57,16 @@ use crate::darwin::{
     fuse_reply_statfs_vanilla,
 };
 
-use crate::filesystem::Filesystem;
-use crate::types::{ConnInfo, DirBuffer, DirPlusBuffer, Entry, Errno, FileAttr, FileInfo, Request, SetAttrs, XattrReply};
+use typed_fuse_core::{Caller, Errno, LookupReply, NodeFs, Runtime, XattrReply};
+
+use crate::conv::{
+    attr_to_stat, entry_to_entry_param, negative_entry_param, setattr_from_raw, statfs_to_raw,
+};
+use crate::ffi::{apply_open, conn_apply, conn_read, fi_fh, fi_flags, DirBuffer};
+use typed_fuse_core::{EntryReply, NodeAttr};
 
 // ---------------------------------------------------------------------
-// Darwin-aliased reply wrappers (see module docs)
+// Darwin-aliased reply wrappers (see module docs / darwin.rs)
 // ---------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
@@ -99,11 +88,19 @@ fn raw_reply_attr(req: fuse_req_t, attr: *const stat, timeout: f64) -> c_int {
 }
 
 #[cfg(target_os = "macos")]
-fn raw_reply_create(req: fuse_req_t, e: *const fuse_entry_param, fi: *const fuse_file_info) -> c_int {
+fn raw_reply_create(
+    req: fuse_req_t,
+    e: *const fuse_entry_param,
+    fi: *const fuse_file_info,
+) -> c_int {
     unsafe { fuse_reply_create_vanilla(req, e, fi) }
 }
 #[cfg(not(target_os = "macos"))]
-fn raw_reply_create(req: fuse_req_t, e: *const fuse_entry_param, fi: *const fuse_file_info) -> c_int {
+fn raw_reply_create(
+    req: fuse_req_t,
+    e: *const fuse_entry_param,
+    fi: *const fuse_file_info,
+) -> c_int {
     unsafe { fuse_reply_create(req, e, fi) }
 }
 
@@ -117,38 +114,34 @@ fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statvfs) -> c_int {
 }
 
 // ---------------------------------------------------------------------
-// FsHolder
+// Holder recovery + shared helpers
 // ---------------------------------------------------------------------
 
-/// Owns a filesystem implementation for the lifetime of a [`Session`].
-/// Boxed and handed to libfuse as opaque `userdata`; recovered by the
-/// trampolines below via `fuse_req_userdata` (or, for `init`/`destroy`,
-/// the userdata pointer libfuse passes directly).
-struct FsHolder<F: Filesystem> {
-    fs: F,
+/// Recovers the `Runtime<F>` associated with an in-flight request. Sound
+/// because `fuse_session_loop` processes requests sequentially (see module
+/// docs).
+fn holder_of<'a, F: NodeFs>(req: fuse_req_t) -> &'a mut Runtime<F> {
+    unsafe { &mut *(fuse_req_userdata(req) as *mut Runtime<F>) }
 }
 
-/// Recovers the `FsHolder<F>` associated with an in-flight request.
-///
-/// Sound because `fuse_session_loop` (the only driver of requests this
-/// crate supports) processes requests sequentially: no two trampolines for
-/// the same session are ever running concurrently, so this unique
-/// `&mut` never aliases another live reference.
-fn holder_of<'a, F: Filesystem>(req: fuse_req_t) -> &'a mut FsHolder<F> {
-    unsafe { &mut *(fuse_req_userdata(req) as *mut FsHolder<F>) }
+/// Extracts the calling process's credentials from a request.
+fn caller_of(req: fuse_req_t) -> Caller {
+    let ctx: &fuse_ctx = unsafe { &*fuse_req_ctx(req) };
+    Caller {
+        uid: ctx.uid as u32,
+        gid: ctx.gid as u32,
+        pid: ctx.pid as u32,
+        umask: ctx.umask as u32,
+    }
 }
 
-// ---------------------------------------------------------------------
-// small shared helpers
-// ---------------------------------------------------------------------
-
-/// Decodes a non-null, NUL-terminated C string as UTF-8.
 fn c_str<'a>(ptr: *const c_char) -> Result<&'a str, Errno> {
-    unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|_| Errno::EILSEQ)
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| Errno::EILSEQ)
 }
 
-/// Decodes a name argument, replying `EILSEQ` (without calling into the
-/// filesystem) and returning from the enclosing `unsafe extern "C" fn` on
+/// Decodes a name argument, replying `EILSEQ` and returning from the shim on
 /// invalid UTF-8.
 macro_rules! try_name {
     ($req:expr, $ptr:expr) => {
@@ -162,8 +155,6 @@ macro_rules! try_name {
     };
 }
 
-/// Runs `f`, converting a panic into `Err(Errno::EIO)` instead of
-/// unwinding across the `extern "C"` boundary.
 fn catch_unwind<T>(f: impl FnOnce() -> Result<T, Errno>) -> Result<T, Errno> {
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
@@ -171,36 +162,23 @@ fn catch_unwind<T>(f: impl FnOnce() -> Result<T, Errno>) -> Result<T, Errno> {
     }
 }
 
-/// Like [`catch_unwind`], but for the `Filesystem` methods that have no
-/// error reply (`init`, `destroy`, `forget`): a panic is logged and
-/// swallowed rather than propagated.
 fn catch_unwind_unit(f: impl FnOnce()) {
     if panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
         eprintln!("fuse3: filesystem callback panicked; no reply is possible for this operation");
     }
 }
 
-/// Recovers the filesystem behind `req` and runs `f` against it under
-/// [`catch_unwind`].
-///
-/// This is the single entry point every replying trampoline goes through
-/// to reach the [`Filesystem`]; it exists so the holder recovery (see
-/// [`holder_of`] for the soundness argument) and the panic guard (see the
-/// module docs) can never be paired incorrectly in an individual shim.
-/// The shim keeps only its unique parts: raw argument decoding before the
-/// call, and mapping the `Ok` value to the right `fuse_reply_*` after.
-///
-/// The filesystem reference is handed to `f` at the caller-chosen
-/// lifetime `'a` (ultimately unconstrained, like [`holder_of`]'s) so that
-/// return values borrowing from the filesystem - `read`'s `Cow` - can
-/// flow out through `R`.
-fn call_fs<'a, F: Filesystem + 'a, R>(
+/// Recovers the runtime behind `req`, builds a [`Caller`], and runs `f`
+/// under [`catch_unwind`]. The runtime reference is handed to `f` at the
+/// caller-chosen lifetime `'a` so that borrowing return values (`read`'s
+/// `Cow`) can flow out through `R`.
+fn call_fs<'a, F: NodeFs + 'a, R>(
     req: fuse_req_t,
-    f: impl FnOnce(&'a mut F, &Request) -> Result<R, Errno>,
+    f: impl FnOnce(&'a mut Runtime<F>, &Caller) -> Result<R, Errno>,
 ) -> Result<R, Errno> {
-    let holder = holder_of::<F>(req);
-    let request = Request::new(req);
-    catch_unwind(move || f(&mut holder.fs, &request))
+    let rt = holder_of::<F>(req);
+    let caller = caller_of(req);
+    catch_unwind(move || f(rt, &caller))
 }
 
 fn reply_err(req: fuse_req_t, errno: Errno) {
@@ -211,18 +189,23 @@ fn reply_ok(req: fuse_req_t) {
     unsafe { fuse_reply_err(req, 0) };
 }
 
-fn reply_entry(req: fuse_req_t, entry: &Entry) {
-    let param = entry.to_entry_param();
+fn reply_entry(req: fuse_req_t, entry: &EntryReply, ttl: Duration) {
+    let param = entry_to_entry_param(entry.ino, entry.generation, &entry.attr, ttl);
     raw_reply_entry(req, &param);
 }
 
-fn reply_attr(req: fuse_req_t, attr: &FileAttr, timeout: Duration) {
-    let st = attr.to_stat();
-    raw_reply_attr(req, &st, timeout.as_secs_f64());
+fn reply_negative(req: fuse_req_t, ttl: Duration) {
+    let param = negative_entry_param(ttl);
+    raw_reply_entry(req, &param);
 }
 
-/// Sends a `readdir`/`readdirplus` buffer, translating an empty buffer to
-/// the null/zero-size reply that signals end-of-stream.
+fn reply_attr(req: fuse_req_t, ino: u64, attr: &NodeAttr, ttl: Duration) {
+    let st = attr_to_stat(ino, attr);
+    raw_reply_attr(req, &st, ttl.as_secs_f64());
+}
+
+/// Sends a `readdir` buffer, translating an empty buffer to the null/zero
+/// reply that signals end-of-stream.
 fn reply_dir_buf(req: fuse_req_t, data: &[u8]) {
     if data.is_empty() {
         unsafe { fuse_reply_buf(req, ptr::null(), 0) };
@@ -231,11 +214,7 @@ fn reply_dir_buf(req: fuse_req_t, data: &[u8]) {
     }
 }
 
-/// Implements the `getxattr`/`listxattr` size-query protocol: a requested
-/// size of zero asks for just the value's length; otherwise the value is
-/// sent if it fits, or `ERANGE` if it doesn't. `XattrReply::Size` answers
-/// a data request with `EIO` (the wrapper has no data to send, and
-/// `ERANGE` would make the kernel retry forever).
+/// Implements the `getxattr`/`listxattr` size-query protocol.
 fn reply_xattr(req: fuse_req_t, reply: &XattrReply, requested_size: usize) {
     match reply {
         XattrReply::Size(len) => {
@@ -261,113 +240,102 @@ fn reply_xattr(req: fuse_req_t, reply: &XattrReply, requested_size: usize) {
 // Trampolines
 // ---------------------------------------------------------------------
 
-unsafe extern "C" fn init_shim<F: Filesystem>(userdata: *mut c_void, conn: *mut fuse_conn_info) {
-    let holder = unsafe { &mut *(userdata as *mut FsHolder<F>) };
-    let mut conn_info = ConnInfo::new(conn);
-    catch_unwind_unit(|| holder.fs.init(&mut conn_info));
+unsafe extern "C" fn init_shim<F: NodeFs>(userdata: *mut c_void, conn: *mut fuse_conn_info) {
+    let rt = unsafe { &mut *(userdata as *mut Runtime<F>) };
+    let mut info = conn_read(conn);
+    catch_unwind_unit(|| rt.init(&mut info));
+    conn_apply(conn, &info);
 }
 
-unsafe extern "C" fn destroy_shim<F: Filesystem>(userdata: *mut c_void) {
-    let holder = unsafe { &mut *(userdata as *mut FsHolder<F>) };
-    catch_unwind_unit(|| holder.fs.destroy());
+unsafe extern "C" fn destroy_shim<F: NodeFs>(userdata: *mut c_void) {
+    let rt = unsafe { &mut *(userdata as *mut Runtime<F>) };
+    catch_unwind_unit(|| rt.destroy());
 }
 
-unsafe extern "C" fn lookup_shim<F: Filesystem>(
+unsafe extern "C" fn lookup_shim<F: NodeFs>(
     req: fuse_req_t,
     parent: fuse_ino_t,
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| fs.lookup(request, parent, name)) {
-        Ok(entry) => reply_entry(req, &entry),
+    match call_fs::<F, _>(req, |rt, c| rt.lookup(parent, name, c)) {
+        Ok(LookupReply::Found(entry)) => reply_entry(req, &entry, holder_of::<F>(req).ttl()),
+        Ok(LookupReply::Negative) => reply_negative(req, holder_of::<F>(req).negative_ttl()),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn forget_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t, nlookup: u64) {
-    let holder = holder_of::<F>(req);
-    catch_unwind_unit(|| holder.fs.forget(ino, nlookup));
+unsafe extern "C" fn forget_shim<F: NodeFs>(req: fuse_req_t, ino: fuse_ino_t, nlookup: u64) {
+    let rt = holder_of::<F>(req);
+    catch_unwind_unit(|| rt.forget(ino, nlookup));
     unsafe { fuse_reply_none(req) };
 }
 
-unsafe extern "C" fn forget_multi_shim<F: Filesystem>(
+unsafe extern "C" fn forget_multi_shim<F: NodeFs>(
     req: fuse_req_t,
     count: usize,
     forgets: *mut fuse_forget_data,
 ) {
-    let holder = holder_of::<F>(req);
+    let rt = holder_of::<F>(req);
     let entries = unsafe { std::slice::from_raw_parts(forgets, count) };
-    // One catch_unwind around the whole batch: after a panic the
-    // filesystem may be in an inconsistent state, so the remaining
-    // forgets are dropped rather than invoked on it.
     catch_unwind_unit(|| {
         for entry in entries {
-            holder.fs.forget(entry.ino, entry.nlookup);
+            rt.forget(entry.ino, entry.nlookup);
         }
     });
     unsafe { fuse_reply_none(req) };
 }
 
-unsafe extern "C" fn getattr_shim<F: Filesystem>(
+unsafe extern "C" fn getattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
-    fi: *mut fuse_file_info,
+    _fi: *mut fuse_file_info,
 ) {
-    let fh = FileInfo::from_raw(fi).map(|f| f.fh);
-    match call_fs::<F, _>(req, |fs, request| fs.getattr(request, ino, fh)) {
-        Ok((attr, timeout)) => reply_attr(req, &attr, timeout),
+    match call_fs::<F, _>(req, |rt, c| rt.getattr(ino, c)) {
+        Ok(attr) => reply_attr(req, ino, &attr, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
 }
 
-/// The shared implementation behind the per-platform `setattr_shim`
-/// wrappers below (which only differ in the raw `attr` pointer's declared
-/// type).
-fn setattr_shim_impl<F: Filesystem>(
+fn setattr_shim_impl<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
-    attrs: &SetAttrs,
-    fi: *mut fuse_file_info,
+    attr: *const stat,
+    to_set: c_int,
 ) {
-    let fh = FileInfo::from_raw(fi).map(|f| f.fh);
-    match call_fs::<F, _>(req, |fs, request| fs.setattr(request, ino, attrs, fh)) {
-        Ok((attr, timeout)) => reply_attr(req, &attr, timeout),
+    let set = setattr_from_raw(attr, to_set);
+    match call_fs::<F, _>(req, |rt, c| rt.setattr(ino, &set, c)) {
+        Ok(a) => reply_attr(req, ino, &a, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
 }
 
-// SAFETY (macOS): bindgen types this callback's `attr` argument as
-// `*mut fuse_darwin_attr` because the header was parsed with Darwin
-// extensions enabled by default. This crate always disables Darwin
-// extensions at the session level (`set_darwin_extensions_enabled(0)`, see
-// `Session::new`), so libfuse actually passes a vanilla `struct stat*` at
-// runtime; reinterpreting the pointer as `*const stat` below is what makes
-// `SetAttrs::from_raw` (which expects the vanilla layout) correct.
+// SAFETY (macOS): bindgen types `attr` as `*mut fuse_darwin_attr` because the
+// header was parsed with Darwin extensions enabled; the session disables them
+// at runtime, so libfuse passes a vanilla `stat*`. See module docs.
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn setattr_shim<F: Filesystem>(
+unsafe extern "C" fn setattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     attr: *mut fuse_darwin_attr,
     to_set: c_int,
-    fi: *mut fuse_file_info,
+    _fi: *mut fuse_file_info,
 ) {
-    let attrs = SetAttrs::from_raw(attr as *const stat, to_set);
-    setattr_shim_impl::<F>(req, ino, &attrs, fi);
+    setattr_shim_impl::<F>(req, ino, attr as *const stat, to_set);
 }
 #[cfg(not(target_os = "macos"))]
-unsafe extern "C" fn setattr_shim<F: Filesystem>(
+unsafe extern "C" fn setattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     attr: *mut stat,
     to_set: c_int,
-    fi: *mut fuse_file_info,
+    _fi: *mut fuse_file_info,
 ) {
-    let attrs = SetAttrs::from_raw(attr as *const stat, to_set);
-    setattr_shim_impl::<F>(req, ino, &attrs, fi);
+    setattr_shim_impl::<F>(req, ino, attr as *const stat, to_set);
 }
 
-unsafe extern "C" fn readlink_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t) {
-    match call_fs::<F, _>(req, |fs, request| fs.readlink(request, ino)) {
+unsafe extern "C" fn readlink_shim<F: NodeFs>(req: fuse_req_t, ino: fuse_ino_t) {
+    match call_fs::<F, _>(req, |rt, c| rt.readlink(ino, c)) {
         Ok(target) => match CString::new(target) {
             Ok(c) => {
                 unsafe { fuse_reply_readlink(req, c.as_ptr()) };
@@ -378,7 +346,7 @@ unsafe extern "C" fn readlink_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino
     }
 }
 
-unsafe extern "C" fn mknod_shim<F: Filesystem>(
+unsafe extern "C" fn mknod_shim<F: NodeFs>(
     req: fuse_req_t,
     parent: fuse_ino_t,
     name: *const c_char,
@@ -386,52 +354,52 @@ unsafe extern "C" fn mknod_shim<F: Filesystem>(
     rdev: dev_t,
 ) {
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.mknod(request, parent, name, mode as u32, rdev as u32)
+    match call_fs::<F, _>(req, |rt, c| {
+        rt.mknod(parent, name, mode as u32, rdev as u32, c.umask, c)
     }) {
-        Ok(entry) => reply_entry(req, &entry),
+        Ok(entry) => reply_entry(req, &entry, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn mkdir_shim<F: Filesystem>(
+unsafe extern "C" fn mkdir_shim<F: NodeFs>(
     req: fuse_req_t,
     parent: fuse_ino_t,
     name: *const c_char,
     mode: mode_t,
 ) {
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| fs.mkdir(request, parent, name, mode as u32)) {
-        Ok(entry) => reply_entry(req, &entry),
+    match call_fs::<F, _>(req, |rt, c| rt.mkdir(parent, name, mode as u32, c.umask, c)) {
+        Ok(entry) => reply_entry(req, &entry, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn unlink_shim<F: Filesystem>(
+unsafe extern "C" fn unlink_shim<F: NodeFs>(
     req: fuse_req_t,
     parent: fuse_ino_t,
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| fs.unlink(request, parent, name)) {
+    match call_fs::<F, _>(req, |rt, c| rt.unlink(parent, name, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn rmdir_shim<F: Filesystem>(
+unsafe extern "C" fn rmdir_shim<F: NodeFs>(
     req: fuse_req_t,
     parent: fuse_ino_t,
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| fs.rmdir(request, parent, name)) {
+    match call_fs::<F, _>(req, |rt, c| rt.rmdir(parent, name, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn symlink_shim<F: Filesystem>(
+unsafe extern "C" fn symlink_shim<F: NodeFs>(
     req: fuse_req_t,
     link: *const c_char,
     parent: fuse_ino_t,
@@ -439,13 +407,13 @@ unsafe extern "C" fn symlink_shim<F: Filesystem>(
 ) {
     let link = try_name!(req, link);
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| fs.symlink(request, parent, name, link)) {
-        Ok(entry) => reply_entry(req, &entry),
+    match call_fs::<F, _>(req, |rt, c| rt.symlink(parent, name, link, c)) {
+        Ok(entry) => reply_entry(req, &entry, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn rename_shim<F: Filesystem>(
+unsafe extern "C" fn rename_shim<F: NodeFs>(
     req: fuse_req_t,
     parent: fuse_ino_t,
     name: *const c_char,
@@ -455,53 +423,49 @@ unsafe extern "C" fn rename_shim<F: Filesystem>(
 ) {
     let name = try_name!(req, name);
     let newname = try_name!(req, newname);
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.rename(request, parent, name, newparent, newname, flags)
-    }) {
+    match call_fs::<F, _>(req, |rt, c| rt.rename(parent, name, newparent, newname, flags, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn link_shim<F: Filesystem>(
+unsafe extern "C" fn link_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     newparent: fuse_ino_t,
     newname: *const c_char,
 ) {
     let newname = try_name!(req, newname);
-    match call_fs::<F, _>(req, |fs, request| fs.link(request, ino, newparent, newname)) {
-        Ok(entry) => reply_entry(req, &entry),
+    match call_fs::<F, _>(req, |rt, c| rt.link(ino, newparent, newname, c)) {
+        Ok(entry) => reply_entry(req, &entry, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn open_shim<F: Filesystem>(
+unsafe extern "C" fn open_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| fs.open(request, ino, &file_info)) {
+    let flags = fi_flags(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.open(ino, flags, c)) {
         Ok(reply) => {
-            reply.apply(fi);
+            apply_open(fi, reply.fh, reply.hints);
             unsafe { fuse_reply_open(req, fi as *const fuse_file_info) };
         }
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn read_shim<F: Filesystem>(
+unsafe extern "C" fn read_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     size: usize,
     off: off_t,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.read(request, ino, size, off as u64, &file_info)
-    }) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.read(ino, fh, off as u64, size, c)) {
         Ok(data) => {
             let len = data.len().min(size);
             unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
@@ -510,7 +474,7 @@ unsafe extern "C" fn read_shim<F: Filesystem>(
     }
 }
 
-unsafe extern "C" fn write_shim<F: Filesystem>(
+unsafe extern "C" fn write_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     buf: *const c_char,
@@ -519,10 +483,8 @@ unsafe extern "C" fn write_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let data = unsafe { std::slice::from_raw_parts(buf as *const u8, size) };
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.write(request, ino, data, off as u64, &file_info)
-    }) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.write(ino, fh, data, off as u64, c)) {
         Ok(count) => {
             unsafe { fuse_reply_write(req, count) };
         }
@@ -530,151 +492,129 @@ unsafe extern "C" fn write_shim<F: Filesystem>(
     }
 }
 
-unsafe extern "C" fn flush_shim<F: Filesystem>(
+unsafe extern "C" fn flush_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| fs.flush(request, ino, &file_info)) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.flush(ino, fh, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn release_shim<F: Filesystem>(
+unsafe extern "C" fn release_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| fs.release(request, ino, &file_info)) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.release(ino, fh, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn fsync_shim<F: Filesystem>(
+unsafe extern "C" fn fsync_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     datasync: c_int,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| fs.fsync(request, ino, datasync != 0, &file_info)) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.fsync(ino, fh, datasync != 0, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn opendir_shim<F: Filesystem>(
+unsafe extern "C" fn opendir_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| fs.opendir(request, ino, &file_info)) {
+    let flags = fi_flags(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.opendir(ino, flags, c)) {
         Ok(reply) => {
-            reply.apply(fi);
+            apply_open(fi, reply.fh, reply.hints);
             unsafe { fuse_reply_open(req, fi as *const fuse_file_info) };
         }
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn readdir_shim<F: Filesystem>(
+unsafe extern "C" fn readdir_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     size: usize,
     off: off_t,
     fi: *mut fuse_file_info,
 ) {
-    let fh = FileInfo::from_raw(fi).map(|f| f.fh).unwrap_or(0);
+    let fh = fi_fh(fi);
     let mut buf = DirBuffer::new(req, size);
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.readdir(request, ino, off as u64, fh, &mut buf)
-    }) {
+    match call_fs::<F, _>(req, |rt, c| rt.readdir(ino, fh, off as u64, &mut buf, c)) {
         Ok(()) => reply_dir_buf(req, buf.as_slice()),
         Err(e) => reply_err(req, e),
     }
 }
 
-// libfuse advertises the READDIRPLUS capability to the kernel whenever
-// `fuse_lowlevel_ops::readdirplus` is non-NULL (see `do_init` in libfuse's
-// `fuse_lowlevel.c`), and this crate always registers it (`Filesystem`
-// always has a `readdirplus`, defaulting to `ENOSYS`). Once advertised,
-// the kernel sends READDIRPLUS for every directory listing and never
-// falls back to plain READDIR on a per-request basis - so a filesystem
-// that only implements `Filesystem::readdir` (the common case) would
-// otherwise see every `ls`/directory listing fail with ENOSYS. To avoid
-// that, an `ENOSYS` from `readdirplus` falls back to calling `readdir`
-// and synthesizing a READDIRPLUS-shaped reply from it via
-// `DirBuffer::new_plus_fallback` (see its doc comment for details).
-unsafe extern "C" fn readdirplus_shim<F: Filesystem>(
+// libfuse advertises READDIRPLUS whenever the callback is registered (this
+// crate always registers it), after which the kernel never falls back to
+// plain READDIR. A filesystem only implements `NodeFs::readdir`, so this shim
+// drives that same `readdir` into a plus-shaped buffer with nodeid 0 (no
+// lookup performed, no matching `forget` needed).
+unsafe extern "C" fn readdirplus_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     size: usize,
     off: off_t,
     fi: *mut fuse_file_info,
 ) {
-    let fh = FileInfo::from_raw(fi).map(|f| f.fh).unwrap_or(0);
-
-    let mut buf = DirPlusBuffer::new(req, size);
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.readdirplus(request, ino, off as u64, fh, &mut buf)
-    }) {
+    let fh = fi_fh(fi);
+    let mut buf = DirBuffer::new_plus_fallback(req, size);
+    match call_fs::<F, _>(req, |rt, c| rt.readdir(ino, fh, off as u64, &mut buf, c)) {
         Ok(()) => reply_dir_buf(req, buf.as_slice()),
-        Err(Errno::ENOSYS) => {
-            let mut fallback = DirBuffer::new_plus_fallback(req, size);
-            match call_fs::<F, _>(req, |fs, request| {
-                fs.readdir(request, ino, off as u64, fh, &mut fallback)
-            }) {
-                Ok(()) => reply_dir_buf(req, fallback.as_slice()),
-                Err(e) => reply_err(req, e),
-            }
-        }
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn releasedir_shim<F: Filesystem>(
+unsafe extern "C" fn releasedir_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| fs.releasedir(request, ino, &file_info)) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.releasedir(ino, fh, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn fsyncdir_shim<F: Filesystem>(
+unsafe extern "C" fn fsyncdir_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     datasync: c_int,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.fsyncdir(request, ino, datasync != 0, &file_info)
-    }) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.fsyncdir(ino, fh, datasync != 0, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn statfs_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t) {
-    match call_fs::<F, _>(req, |fs, request| fs.statfs(request, ino)) {
+unsafe extern "C" fn statfs_shim<F: NodeFs>(req: fuse_req_t, ino: fuse_ino_t) {
+    match call_fs::<F, _>(req, |rt, c| rt.statfs(ino, c)) {
         Ok(stats) => {
-            let raw = stats.to_raw();
+            let raw = statfs_to_raw(&stats);
             raw_reply_statfs(req, &raw);
         }
         Err(e) => reply_err(req, e),
     }
 }
 
-fn setxattr_shim_impl<F: Filesystem>(
+fn setxattr_shim_impl<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     name: *const c_char,
@@ -684,19 +624,14 @@ fn setxattr_shim_impl<F: Filesystem>(
 ) {
     let name = try_name!(req, name);
     let value = unsafe { std::slice::from_raw_parts(value as *const u8, size) };
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.setxattr(request, ino, name, value, flags)
-    }) {
+    match call_fs::<F, _>(req, |rt, c| rt.setxattr(ino, name, value, flags, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-// The macOS callback carries an extra `position` argument (used by
-// resource-fork-aware clients); this crate does not expose it in the
-// portable `Filesystem::setxattr` signature, so it is simply ignored.
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn setxattr_shim<F: Filesystem>(
+unsafe extern "C" fn setxattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     name: *const c_char,
@@ -708,7 +643,7 @@ unsafe extern "C" fn setxattr_shim<F: Filesystem>(
     setxattr_shim_impl::<F>(req, ino, name, value, size, flags);
 }
 #[cfg(not(target_os = "macos"))]
-unsafe extern "C" fn setxattr_shim<F: Filesystem>(
+unsafe extern "C" fn setxattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     name: *const c_char,
@@ -719,22 +654,21 @@ unsafe extern "C" fn setxattr_shim<F: Filesystem>(
     setxattr_shim_impl::<F>(req, ino, name, value, size, flags);
 }
 
-fn getxattr_shim_impl<F: Filesystem>(
+fn getxattr_shim_impl<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     name: *const c_char,
     size: usize,
 ) {
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| fs.getxattr(request, ino, name, size)) {
+    match call_fs::<F, _>(req, |rt, c| rt.getxattr(ino, name, size, c)) {
         Ok(reply) => reply_xattr(req, &reply, size),
         Err(e) => reply_err(req, e),
     }
 }
 
-// Same macOS-only `position` argument as `setxattr_shim`; ignored.
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn getxattr_shim<F: Filesystem>(
+unsafe extern "C" fn getxattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     name: *const c_char,
@@ -744,7 +678,7 @@ unsafe extern "C" fn getxattr_shim<F: Filesystem>(
     getxattr_shim_impl::<F>(req, ino, name, size);
 }
 #[cfg(not(target_os = "macos"))]
-unsafe extern "C" fn getxattr_shim<F: Filesystem>(
+unsafe extern "C" fn getxattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     name: *const c_char,
@@ -753,33 +687,33 @@ unsafe extern "C" fn getxattr_shim<F: Filesystem>(
     getxattr_shim_impl::<F>(req, ino, name, size);
 }
 
-unsafe extern "C" fn listxattr_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t, size: usize) {
-    match call_fs::<F, _>(req, |fs, request| fs.listxattr(request, ino, size)) {
+unsafe extern "C" fn listxattr_shim<F: NodeFs>(req: fuse_req_t, ino: fuse_ino_t, size: usize) {
+    match call_fs::<F, _>(req, |rt, c| rt.listxattr(ino, size, c)) {
         Ok(reply) => reply_xattr(req, &reply, size),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn removexattr_shim<F: Filesystem>(
+unsafe extern "C" fn removexattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     name: *const c_char,
 ) {
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |fs, request| fs.removexattr(request, ino, name)) {
+    match call_fs::<F, _>(req, |rt, c| rt.removexattr(ino, name, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn access_shim<F: Filesystem>(req: fuse_req_t, ino: fuse_ino_t, mask: c_int) {
-    match call_fs::<F, _>(req, |fs, request| fs.access(request, ino, mask)) {
+unsafe extern "C" fn access_shim<F: NodeFs>(req: fuse_req_t, ino: fuse_ino_t, mask: c_int) {
+    match call_fs::<F, _>(req, |rt, c| rt.access(ino, mask, c)) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn create_shim<F: Filesystem>(
+unsafe extern "C" fn create_shim<F: NodeFs>(
     req: fuse_req_t,
     parent: fuse_ino_t,
     name: *const c_char,
@@ -787,20 +721,25 @@ unsafe extern "C" fn create_shim<F: Filesystem>(
     fi: *mut fuse_file_info,
 ) {
     let name = try_name!(req, name);
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.create(request, parent, name, mode as u32, &file_info)
+    let flags = fi_flags(fi);
+    match call_fs::<F, _>(req, |rt, c| {
+        rt.create(parent, name, mode as u32, c.umask, flags, c)
     }) {
         Ok((entry, reply)) => {
-            reply.apply(fi);
-            let param = entry.to_entry_param();
+            apply_open(fi, reply.fh, reply.hints);
+            let param = entry_to_entry_param(
+                entry.ino,
+                entry.generation,
+                &entry.attr,
+                holder_of::<F>(req).ttl(),
+            );
             raw_reply_create(req, &param, fi as *const fuse_file_info);
         }
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn fallocate_shim<F: Filesystem>(
+unsafe extern "C" fn fallocate_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     mode: c_int,
@@ -808,26 +747,24 @@ unsafe extern "C" fn fallocate_shim<F: Filesystem>(
     length: off_t,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.fallocate(request, ino, mode, offset as u64, length as u64, &file_info)
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| {
+        rt.fallocate(ino, fh, mode, offset as u64, length as u64, c)
     }) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
 }
 
-unsafe extern "C" fn lseek_shim<F: Filesystem>(
+unsafe extern "C" fn lseek_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
     off: off_t,
     whence: c_int,
     fi: *mut fuse_file_info,
 ) {
-    let file_info = FileInfo::from_raw(fi).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.lseek(request, ino, off as u64, whence, &file_info)
-    }) {
+    let fh = fi_fh(fi);
+    match call_fs::<F, _>(req, |rt, c| rt.lseek(ino, fh, off as u64, whence, c)) {
         Ok(new_off) => {
             unsafe { fuse_reply_lseek(req, new_off as off_t) };
         }
@@ -836,31 +773,19 @@ unsafe extern "C" fn lseek_shim<F: Filesystem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn copy_file_range_shim<F: Filesystem>(
+unsafe extern "C" fn copy_file_range_shim<F: NodeFs>(
     req: fuse_req_t,
     ino_in: fuse_ino_t,
     off_in: off_t,
-    fi_in: *mut fuse_file_info,
+    _fi_in: *mut fuse_file_info,
     ino_out: fuse_ino_t,
     off_out: off_t,
-    fi_out: *mut fuse_file_info,
+    _fi_out: *mut fuse_file_info,
     len: usize,
     flags: c_int,
 ) {
-    let file_info_in = FileInfo::from_raw(fi_in).unwrap_or_default();
-    let file_info_out = FileInfo::from_raw(fi_out).unwrap_or_default();
-    match call_fs::<F, _>(req, |fs, request| {
-        fs.copy_file_range(
-            request,
-            ino_in,
-            off_in as u64,
-            &file_info_in,
-            ino_out,
-            off_out as u64,
-            &file_info_out,
-            len as u64,
-            flags,
-        )
+    match call_fs::<F, _>(req, |rt, c| {
+        rt.copy_file_range(ino_in, off_in as u64, ino_out, off_out as u64, len as u64, flags, c)
     }) {
         Ok(count) => {
             unsafe { fuse_reply_write(req, count) };
@@ -873,13 +798,11 @@ unsafe extern "C" fn copy_file_range_shim<F: Filesystem>(
 // Ops table
 // ---------------------------------------------------------------------
 
-/// Builds a `fuse_lowlevel_ops` table with every operation covered by
-/// [`Filesystem`] wired up to its trampoline. Operations this crate does
-/// not cover (`getlk`/`setlk`/`flock`, `ioctl`, `poll`, `bmap`,
-/// `write_buf`, `retrieve_reply`, `statx`, `tmpfile`,
-/// `setvolname`/`monitor` and other macOS-only extensions, ...) are left
-/// `None`.
-pub(crate) fn make_ops<F: Filesystem>() -> fuse_lowlevel_ops {
+/// Builds a `fuse_lowlevel_ops` table wiring every operation the runtime
+/// covers to its trampoline. Uncovered ops (`getlk`/`setlk`/`flock`,
+/// `ioctl`, `poll`, `bmap`, `write_buf`, `retrieve_reply`, `statx`,
+/// `tmpfile`, macOS-only extensions, ...) are left `None`.
+pub(crate) fn make_ops<F: NodeFs>() -> fuse_lowlevel_ops {
     fuse_lowlevel_ops {
         init: Some(init_shim::<F>),
         destroy: Some(destroy_shim::<F>),
@@ -928,21 +851,12 @@ pub(crate) fn make_ops<F: Filesystem>() -> fuse_lowlevel_ops {
 /// A libfuse mount option, rendered to a `-o key[=value]` argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountOption {
-    /// Mount read-only (`-o ro`).
     ReadOnly,
-    /// Allow other users to access the mount (`-o allow_other`).
     AllowOther,
-    /// Automatically unmount when the owning process exits
-    /// (`-o auto_unmount`).
     AutoUnmount,
-    /// Let the kernel perform its own permission checks
-    /// (`-o default_permissions`).
     DefaultPermissions,
-    /// Sets the filesystem name shown by `mount`/`df` (`-o fsname=NAME`).
     FsName(String),
-    /// Sets the filesystem subtype (`-o subtype=NAME`).
     Subtype(String),
-    /// Any other raw `-o` option, passed through verbatim.
     Custom(String),
 }
 
@@ -967,16 +881,10 @@ impl MountOption {
 /// Errors returned by [`Session`] setup/teardown.
 #[derive(Debug)]
 pub enum Error {
-    /// `fuse_session_new_versioned` returned null.
     SessionNew,
-    /// `fuse_session_mount` failed.
     Mount,
-    /// `fuse_set_signal_handlers` failed.
     SignalHandlers,
-    /// `fuse_session_loop` returned a non-zero code.
     Loop(i32),
-    /// The given mountpoint could not be used (e.g. it contains a NUL
-    /// byte).
     InvalidMountpoint(String),
 }
 
@@ -1000,25 +908,19 @@ impl std::error::Error for Error {}
 // Session
 // ---------------------------------------------------------------------
 
-/// A mounted (or mountable) FUSE session driving a single [`Filesystem`]
-/// implementation, single-threaded, via `fuse_session_loop`.
-///
-/// `Session` is `!Send` (it owns raw libfuse pointers that must stay on the
-/// thread that created them) - this is enforced implicitly by the raw
-/// pointer fields.
-pub struct Session<F: Filesystem> {
+/// A mounted (or mountable) FUSE session driving a single [`NodeFs`]
+/// implementation, single-threaded, via `fuse_session_loop`. `!Send` by
+/// virtue of its raw pointer fields.
+pub struct Session<F: NodeFs> {
     session: *mut fuse_session,
-    userdata: *mut FsHolder<F>,
+    runtime: *mut Runtime<F>,
     mounted: bool,
-    // Kept alive for the lifetime of the session as a defensive measure:
-    // nothing in this crate relies on `fuse_session_new_versioned` copying
-    // rather than retaining pointers into the `fuse_args` it was given.
     _arg_storage: Vec<CString>,
 }
 
-impl<F: Filesystem> Session<F> {
+impl<F: NodeFs> Session<F> {
     /// Creates a new (not-yet-mounted) session for `fs`, configured with
-    /// `options`.
+    /// `options`. The root node is seeded from [`NodeFs::root`].
     pub fn new(fs: F, options: &[MountOption]) -> Result<Self, Error> {
         let mut arg_strings = vec!["fuse3".to_string()];
         if !options.is_empty() {
@@ -1034,7 +936,10 @@ impl<F: Filesystem> Session<F> {
             .into_iter()
             .map(|s| CString::new(s).expect("mount option string contains a NUL byte"))
             .collect();
-        let mut argv: Vec<*mut c_char> = arg_cstrings.iter().map(|s| s.as_ptr() as *mut c_char).collect();
+        let mut argv: Vec<*mut c_char> = arg_cstrings
+            .iter()
+            .map(|s| s.as_ptr() as *mut c_char)
+            .collect();
         let mut args = fuse_args {
             argc: argv.len() as c_int,
             argv: argv.as_mut_ptr(),
@@ -1048,13 +953,11 @@ impl<F: Filesystem> Session<F> {
             hotfix: FUSE_HOTFIX_VERSION as _,
             ..Default::default()
         };
-        // The reply/trampoline code above always works with the portable
-        // vanilla structs, never the Darwin-extended ones - see the module
-        // docs.
+        // The reply/trampoline code always works with vanilla structs.
         #[cfg(target_os = "macos")]
         version.set_darwin_extensions_enabled(0);
 
-        let userdata: *mut FsHolder<F> = Box::into_raw(Box::new(FsHolder { fs }));
+        let runtime: *mut Runtime<F> = Box::into_raw(Box::new(Runtime::new(fs)));
 
         let session = unsafe {
             fuse_session_new_versioned(
@@ -1062,21 +965,20 @@ impl<F: Filesystem> Session<F> {
                 &ops,
                 std::mem::size_of::<fuse_lowlevel_ops>(),
                 &mut version,
-                userdata as *mut c_void,
+                runtime as *mut c_void,
             )
         };
 
         unsafe { fuse_opt_free_args(&mut args) };
 
         if session.is_null() {
-            // Reclaim ownership so the box is freed rather than leaked.
-            unsafe { drop(Box::from_raw(userdata)) };
+            unsafe { drop(Box::from_raw(runtime)) };
             return Err(Error::SessionNew);
         }
 
         Ok(Session {
             session,
-            userdata,
+            runtime,
             mounted: false,
             _arg_storage: arg_cstrings,
         })
@@ -1094,8 +996,7 @@ impl<F: Filesystem> Session<F> {
         Ok(())
     }
 
-    /// Runs the single-threaded event loop until the filesystem is
-    /// unmounted or a signal terminates it.
+    /// Runs the single-threaded event loop until unmounted or signalled.
     pub fn run(&mut self) -> Result<(), Error> {
         if unsafe { fuse_set_signal_handlers(self.session) } != 0 {
             return Err(Error::SignalHandlers);
@@ -1108,10 +1009,7 @@ impl<F: Filesystem> Session<F> {
         Ok(())
     }
 
-    /// Convenience: creates a session for `fs`, mounts it at `mountpoint`,
-    /// and runs it to completion. Equivalent to [`Session::new`] +
-    /// [`Session::mount`] + [`Session::run`] (unmounting is handled by
-    /// `Drop`).
+    /// Convenience: [`Session::new`] + [`Session::mount`] + [`Session::run`].
     pub fn mount_and_run(fs: F, mountpoint: &str, options: &[MountOption]) -> Result<(), Error> {
         let mut session = Session::new(fs, options)?;
         session.mount(mountpoint)?;
@@ -1119,16 +1017,14 @@ impl<F: Filesystem> Session<F> {
     }
 }
 
-impl<F: Filesystem> Drop for Session<F> {
+impl<F: NodeFs> Drop for Session<F> {
     fn drop(&mut self) {
         unsafe {
             if self.mounted {
                 fuse_session_unmount(self.session);
             }
             fuse_session_destroy(self.session);
-            // `destroy_shim` (called synchronously by `fuse_session_destroy`
-            // above) only borrows the holder; reclaim ownership now.
-            drop(Box::from_raw(self.userdata));
+            drop(Box::from_raw(self.runtime));
         }
     }
 }
@@ -1140,17 +1036,23 @@ impl<F: Filesystem> Drop for Session<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use typed_fuse_core::{Caller, NodeAttr};
 
     struct NullFs;
-    impl Filesystem for NullFs {}
+    impl NodeFs for NullFs {
+        type Node = ();
+        type Handle = ();
+        type DirHandle = ();
+        fn root(&mut self) {}
+        fn getattr(&mut self, _n: &(), _c: &Caller) -> Result<NodeAttr, Errno> {
+            Ok(NodeAttr::default())
+        }
+    }
 
     #[test]
     fn make_ops_registers_covered_callbacks_and_skips_the_rest() {
         let ops = make_ops::<NullFs>();
 
-        // Every op covered by `Filesystem` should be wired up. Linking
-        // this test binary also exercises every `raw_reply_*`/vanilla
-        // Darwin extern referenced transitively by these shims.
         assert!(ops.init.is_some());
         assert!(ops.destroy.is_some());
         assert!(ops.lookup.is_some());
@@ -1188,7 +1090,6 @@ mod tests {
         assert!(ops.copy_file_range.is_some());
         assert!(ops.lseek.is_some());
 
-        // Explicitly out of scope for this crate.
         assert!(ops.getlk.is_none());
         assert!(ops.setlk.is_none());
         assert!(ops.bmap.is_none());
@@ -1208,24 +1109,15 @@ mod tests {
         assert_eq!(MountOption::ReadOnly.render(), "ro");
         assert_eq!(MountOption::AllowOther.render(), "allow_other");
         assert_eq!(MountOption::AutoUnmount.render(), "auto_unmount");
-        assert_eq!(MountOption::DefaultPermissions.render(), "default_permissions");
+        assert_eq!(
+            MountOption::DefaultPermissions.render(),
+            "default_permissions"
+        );
         assert_eq!(MountOption::FsName("myfs".to_string()).render(), "fsname=myfs");
-        assert_eq!(MountOption::Subtype("fuse.myfs".to_string()).render(), "subtype=fuse.myfs");
+        assert_eq!(
+            MountOption::Subtype("fuse.myfs".to_string()).render(),
+            "subtype=fuse.myfs"
+        );
         assert_eq!(MountOption::Custom("noatime".to_string()).render(), "noatime");
-    }
-
-    #[test]
-    fn mount_option_rendering_joins_with_commas() {
-        let options = [
-            MountOption::ReadOnly,
-            MountOption::FsName("myfs".to_string()),
-            MountOption::Custom("noatime".to_string()),
-        ];
-        let joined = options
-            .iter()
-            .map(MountOption::render)
-            .collect::<Vec<_>>()
-            .join(",");
-        assert_eq!(joined, "ro,fsname=myfs,noatime");
     }
 }
