@@ -43,6 +43,79 @@ pub struct ConnInfo {
     pub proto_minor: u32,
     pub max_write: u32,
     pub max_readahead: u32,
+    capable: u32,
+    want: u32,
+}
+
+/// Kernel/libfuse features that a filesystem may negotiate in [`NodeFs::init`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionCapability {
+    AsyncRead,
+    AsyncDirectIo,
+    ParallelDirectoryOperations,
+}
+
+impl ConnInfo {
+    const ASYNC_READ: u32 = 1 << 0;
+    const ASYNC_DIO: u32 = 1 << 15;
+    const PARALLEL_DIROPS: u32 = 1 << 18;
+
+    fn bit(capability: ConnectionCapability) -> u32 {
+        match capability {
+            ConnectionCapability::AsyncRead => Self::ASYNC_READ,
+            ConnectionCapability::AsyncDirectIo => Self::ASYNC_DIO,
+            ConnectionCapability::ParallelDirectoryOperations => Self::PARALLEL_DIROPS,
+        }
+    }
+
+    /// Whether the kernel supports `capability`.
+    pub fn capable(&self, capability: ConnectionCapability) -> bool {
+        self.capable & Self::bit(capability) != 0
+    }
+
+    /// Whether this session currently requests `capability`.
+    pub fn enabled(&self, capability: ConnectionCapability) -> bool {
+        self.want & Self::bit(capability) != 0
+    }
+
+    /// Requests or disables a supported capability. Enabling an unsupported
+    /// capability returns `false` and leaves the request mask unchanged.
+    pub fn set_enabled(&mut self, capability: ConnectionCapability, enabled: bool) -> bool {
+        let bit = Self::bit(capability);
+        if enabled && self.capable & bit == 0 {
+            return false;
+        }
+        if enabled {
+            self.want |= bit
+        } else {
+            self.want &= !bit
+        }
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn from_raw(
+        proto_major: u32,
+        proto_minor: u32,
+        max_write: u32,
+        max_readahead: u32,
+        capable: u32,
+        want: u32,
+    ) -> Self {
+        Self {
+            proto_major,
+            proto_minor,
+            max_write,
+            max_readahead,
+            capable,
+            want,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn want_bits(&self) -> u32 {
+        self.want
+    }
 }
 
 /// Kernel caching hints returned alongside an opened handle.
@@ -52,6 +125,7 @@ pub struct OpenHints {
     pub keep_cache: bool,
     pub nonseekable: bool,
     pub cache_readdir: bool,
+    pub parallel_direct_writes: bool,
 }
 
 /// The result of an `open`/`opendir`/`create`: the filesystem's own handle
@@ -90,6 +164,12 @@ impl<H> Opened<H> {
         self.hints.cache_readdir = value;
         self
     }
+
+    /// Allows direct writes issued through this open handle to overlap.
+    pub fn parallel_direct_writes(mut self, value: bool) -> Self {
+        self.hints.parallel_direct_writes = value;
+        self
+    }
 }
 
 /// The reply to `getxattr`/`listxattr`. The kernel's xattr protocol is
@@ -123,24 +203,24 @@ pub trait DirSink {
 /// deferred deletion), and the file-handle table. Filesystem authors work
 /// with their own [`NodeFs::Node`] and [`NodeFs::Handle`] payloads:
 ///
-/// * Operations on a single existing node receive `&`/`&mut Self::Node`
-///   directly (the runtime resolves it, replying `ENOENT` if it is gone).
-/// * I/O operations additionally receive `&mut Self::Handle`.
+/// * Operations on a single existing node receive `&Self::Node` directly
+///   (the runtime resolves it, replying `ENOENT` if it is gone).
+/// * I/O operations additionally receive `&Self::Handle`.
 /// * Structural / naming operations receive a [`Cx`] to resolve, insert, and
 ///   link other nodes.
 ///
 /// Every method has a default (fallible ones default to `Err(ENOSYS)`;
 /// no-op-style ones to `Ok`), so a filesystem overrides only what it
-/// supports. All methods take `&mut self`: the driving session loop is
-/// single-threaded.
+/// supports. Request callbacks take `&self` and may overlap, including on the
+/// same node and handle. Implementations choose their own interior locking.
 #[allow(unused_variables)]
-pub trait NodeFs: Sized {
+pub trait NodeFs: Sized + Send + Sync {
     /// Per-node data owned and stored by the runtime.
-    type Node;
+    type Node: Send + Sync;
     /// Per-open-file data. Use `()` if the filesystem is stateless per open.
-    type Handle: Default;
+    type Handle: Default + Send + Sync;
     /// Per-open-directory data. Use `()` if not needed.
-    type DirHandle: Default;
+    type DirHandle: Default + Send + Sync;
 
     /// Builds the payload for the root directory. Called once, when the
     /// runtime is constructed.
@@ -150,22 +230,22 @@ pub trait NodeFs: Sized {
     /// filesystems with statically-known contents. Called once, right after
     /// [`NodeFs::root`], with a [`Cx`] so children can be inserted and
     /// recorded. Default: no-op (an empty root).
-    fn populate(&mut self, cx: &mut Cx<'_, Self::Node>) {}
+    fn populate(&mut self, cx: &Cx<'_, Self::Node>) {}
 
     /// Called once when libfuse establishes communication with the kernel.
-    fn init(&mut self, conn: &mut ConnInfo) {}
+    fn init(&self, conn: &mut ConnInfo) {}
 
     /// Called on filesystem exit.
-    fn destroy(&mut self) {}
+    fn destroy(&self) {}
 
     /// Returns the attributes of `node`, including its current link count.
-    fn getattr(&mut self, node: &Self::Node, caller: &Caller) -> Result<NodeAttr, Errno>;
+    fn getattr(&self, node: &Self::Node, caller: &Caller) -> Result<NodeAttr, Errno>;
 
     /// Applies the `Some` fields of `set` to `node`, returning the resulting
     /// attributes.
     fn setattr(
-        &mut self,
-        node: &mut Self::Node,
+        &self,
+        node: &Self::Node,
         set: &SetAttr,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
@@ -176,8 +256,8 @@ pub trait NodeFs: Sized {
     /// hit, `Ok(None)` to populate the kernel's negative-lookup cache, or
     /// `Err` for a hard failure.
     fn lookup(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         caller: &Caller,
@@ -186,7 +266,7 @@ pub trait NodeFs: Sized {
     }
 
     /// Reads the target of the symbolic link `node`.
-    fn readlink(&mut self, node: &Self::Node, caller: &Caller) -> Result<String, Errno> {
+    fn readlink(&self, node: &Self::Node, caller: &Caller) -> Result<String, Errno> {
         Err(Errno::ENOSYS)
     }
 
@@ -195,8 +275,8 @@ pub trait NodeFs: Sized {
     /// and return the id.
     #[allow(clippy::too_many_arguments)]
     fn mknod(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         mode: u32,
@@ -209,8 +289,8 @@ pub trait NodeFs: Sized {
 
     /// Creates a directory named `name` in `parent`.
     fn mkdir(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         mode: u32,
@@ -222,8 +302,8 @@ pub trait NodeFs: Sized {
 
     /// Creates a symbolic link named `name` in `parent` pointing at `target`.
     fn symlink(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         target: &str,
@@ -236,8 +316,8 @@ pub trait NodeFs: Sized {
     /// from the parent and call `cx.remove_link(id)`; the runtime frees the
     /// node once it is also un-looked-up and closed.
     fn unlink(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         caller: &Caller,
@@ -247,8 +327,8 @@ pub trait NodeFs: Sized {
 
     /// Removes the empty directory `name` from `parent`.
     fn rmdir(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         caller: &Caller,
@@ -259,8 +339,8 @@ pub trait NodeFs: Sized {
     /// Renames `name` in `parent` to `newname` in `newparent`.
     #[allow(clippy::too_many_arguments)]
     fn rename(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         newparent: NodeId,
@@ -274,8 +354,8 @@ pub trait NodeFs: Sized {
     /// Creates a hard link to `id` named `newname` in `newparent`. Record
     /// the name and call `cx.add_link(id)`.
     fn link(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         id: NodeId,
         newparent: NodeId,
         newname: &str,
@@ -286,8 +366,8 @@ pub trait NodeFs: Sized {
 
     /// Opens `node`, returning the filesystem's handle object.
     fn open(
-        &mut self,
-        node: &mut Self::Node,
+        &self,
+        node: &Self::Node,
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<Self::Handle>, Errno> {
@@ -298,9 +378,9 @@ pub trait NodeFs: Sized {
     /// may borrow from `self`/`node`/`handle` for a zero-copy reply (they all
     /// share the lifetime `'a`).
     fn read<'a>(
-        &'a mut self,
-        node: &'a mut Self::Node,
-        handle: &'a mut Self::Handle,
+        &'a self,
+        node: &'a Self::Node,
+        handle: &'a Self::Handle,
         offset: u64,
         size: usize,
         caller: &Caller,
@@ -310,9 +390,9 @@ pub trait NodeFs: Sized {
 
     /// Writes `data` to `node` at `offset`, returning the count written.
     fn write(
-        &mut self,
-        node: &mut Self::Node,
-        handle: &mut Self::Handle,
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
         data: &[u8],
         offset: u64,
         caller: &Caller,
@@ -322,9 +402,9 @@ pub trait NodeFs: Sized {
 
     /// Called on each `close()` of an open file.
     fn flush(
-        &mut self,
-        node: &mut Self::Node,
-        handle: &mut Self::Handle,
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
         caller: &Caller,
     ) -> Result<(), Errno> {
         Ok(())
@@ -333,8 +413,8 @@ pub trait NodeFs: Sized {
     /// Called when the last reference to an open file is dropped; consumes
     /// the handle.
     fn release(
-        &mut self,
-        node: &mut Self::Node,
+        &self,
+        node: &Self::Node,
         handle: Self::Handle,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -343,9 +423,9 @@ pub trait NodeFs: Sized {
 
     /// Flushes file contents (and metadata unless `datasync`).
     fn fsync(
-        &mut self,
-        node: &mut Self::Node,
-        handle: &mut Self::Handle,
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -354,8 +434,8 @@ pub trait NodeFs: Sized {
 
     /// Opens the directory `node`.
     fn opendir(
-        &mut self,
-        node: &mut Self::Node,
+        &self,
+        node: &Self::Node,
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<Self::DirHandle>, Errno> {
@@ -369,11 +449,11 @@ pub trait NodeFs: Sized {
     /// `false`.
     #[allow(clippy::too_many_arguments)]
     fn readdir(
-        &mut self,
+        &self,
         node: &Self::Node,
         this: NodeId,
         parent: NodeId,
-        handle: &mut Self::DirHandle,
+        handle: &Self::DirHandle,
         offset: u64,
         sink: &mut dyn DirSink,
         caller: &Caller,
@@ -383,8 +463,8 @@ pub trait NodeFs: Sized {
 
     /// Releases a directory handle; consumes it.
     fn releasedir(
-        &mut self,
-        node: &mut Self::Node,
+        &self,
+        node: &Self::Node,
         handle: Self::DirHandle,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -393,9 +473,9 @@ pub trait NodeFs: Sized {
 
     /// Flushes directory contents.
     fn fsyncdir(
-        &mut self,
-        node: &mut Self::Node,
-        handle: &mut Self::DirHandle,
+        &self,
+        node: &Self::Node,
+        handle: &Self::DirHandle,
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -404,7 +484,7 @@ pub trait NodeFs: Sized {
 
     /// Returns filesystem-wide statistics. Defaults to a minimal-but-valid
     /// value (as libfuse does when the callback is unset).
-    fn statfs(&mut self, caller: &Caller) -> Result<StatFs, Errno> {
+    fn statfs(&self, caller: &Caller) -> Result<StatFs, Errno> {
         Ok(StatFs {
             bsize: 512,
             namelen: 255,
@@ -414,8 +494,8 @@ pub trait NodeFs: Sized {
 
     /// Sets extended attribute `name` on `node`.
     fn setxattr(
-        &mut self,
-        node: &mut Self::Node,
+        &self,
+        node: &Self::Node,
         name: &str,
         value: &[u8],
         flags: i32,
@@ -427,7 +507,7 @@ pub trait NodeFs: Sized {
     /// Returns extended attribute `name` on `node`. A `size` of zero is a
     /// length query (return [`XattrReply::Size`]).
     fn getxattr(
-        &mut self,
+        &self,
         node: &Self::Node,
         name: &str,
         size: usize,
@@ -439,7 +519,7 @@ pub trait NodeFs: Sized {
     /// Returns the NUL-separated extended attribute names on `node`. Same
     /// size-query protocol as [`NodeFs::getxattr`].
     fn listxattr(
-        &mut self,
+        &self,
         node: &Self::Node,
         size: usize,
         caller: &Caller,
@@ -448,25 +528,20 @@ pub trait NodeFs: Sized {
     }
 
     /// Removes extended attribute `name` from `node`.
-    fn removexattr(
-        &mut self,
-        node: &mut Self::Node,
-        name: &str,
-        caller: &Caller,
-    ) -> Result<(), Errno> {
+    fn removexattr(&self, node: &Self::Node, name: &str, caller: &Caller) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Checks access to `node` per the `access(2)` `mask`.
-    fn access(&mut self, node: &Self::Node, mask: i32, caller: &Caller) -> Result<(), Errno> {
+    fn access(&self, node: &Self::Node, mask: i32, caller: &Caller) -> Result<(), Errno> {
         Ok(())
     }
 
     /// Atomically creates and opens a regular file named `name` in `parent`.
     #[allow(clippy::too_many_arguments)]
     fn create(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         parent: NodeId,
         name: &str,
         mode: u32,
@@ -479,9 +554,9 @@ pub trait NodeFs: Sized {
 
     /// Pre-allocates/punches `length` bytes at `offset` in `node`.
     fn fallocate(
-        &mut self,
-        node: &mut Self::Node,
-        handle: &mut Self::Handle,
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
         mode: i32,
         offset: u64,
         length: u64,
@@ -492,9 +567,9 @@ pub trait NodeFs: Sized {
 
     /// Finds the next data region or hole at or after `offset`.
     fn lseek(
-        &mut self,
-        node: &mut Self::Node,
-        handle: &mut Self::Handle,
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
         offset: u64,
         whence: i32,
         caller: &Caller,
@@ -505,8 +580,8 @@ pub trait NodeFs: Sized {
     /// Copies `len` bytes between two nodes (resolvable via `cx`).
     #[allow(clippy::too_many_arguments)]
     fn copy_file_range(
-        &mut self,
-        cx: &mut Cx<'_, Self::Node>,
+        &self,
+        cx: &Cx<'_, Self::Node>,
         id_in: NodeId,
         off_in: u64,
         id_out: NodeId,

@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
 use fuse3::{
@@ -32,6 +33,10 @@ enum Content {
 }
 
 struct Node {
+    inner: RwLock<NodeData>,
+}
+
+struct NodeData {
     kind: FileKind,
     content: Content,
     perm: u16,
@@ -50,21 +55,32 @@ impl Node {
     fn new(kind: FileKind, content: Content, perm: u16, uid: u32, gid: u32, rdev: u32) -> Self {
         let now = SystemTime::now();
         Node {
-            kind,
-            content,
-            perm,
-            uid,
-            gid,
-            rdev,
-            nlink: if kind == FileKind::Directory { 2 } else { 1 },
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            xattrs: BTreeMap::new(),
+            inner: RwLock::new(NodeData {
+                kind,
+                content,
+                perm,
+                uid,
+                gid,
+                rdev,
+                nlink: if kind == FileKind::Directory { 2 } else { 1 },
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                xattrs: BTreeMap::new(),
+            }),
         }
     }
 
+    fn read(&self) -> RwLockReadGuard<'_, NodeData> {
+        self.inner.read().unwrap()
+    }
+    fn write(&self) -> RwLockWriteGuard<'_, NodeData> {
+        self.inner.write().unwrap()
+    }
+}
+
+impl NodeData {
     fn size(&self) -> u64 {
         match &self.content {
             Content::File(v) => v.len() as u64,
@@ -112,30 +128,40 @@ impl MemoryFs {
     /// Validates that `parent` is a directory not already containing `name`.
     fn check_new_entry(cx: &Cx<'_, Node>, parent: NodeId, name: &str) -> Result<(), Errno> {
         match cx.get(parent) {
-            Some(Node {
-                content: Content::Dir(entries),
-                ..
-            }) => {
+            Some(node) => {
+                let node = node.read();
+                let Content::Dir(entries) = &node.content else {
+                    return Err(Errno::ENOTDIR);
+                };
                 if entries.contains_key(name) {
                     Err(Errno::EEXIST)
                 } else {
                     Ok(())
                 }
             }
-            Some(_) => Err(Errno::ENOTDIR),
             None => Err(Errno::ENOENT),
         }
     }
 
+    fn entry(cx: &Cx<'_, Node>, parent: NodeId, name: &str) -> Result<DirEntry, Errno> {
+        let node = cx.get(parent).ok_or(Errno::ENOENT)?;
+        let node = node.read();
+        match &node.content {
+            Content::Dir(entries) => entries.get(name).copied().ok_or(Errno::ENOENT),
+            _ => Err(Errno::ENOTDIR),
+        }
+    }
+
+    fn kind(cx: &Cx<'_, Node>, id: NodeId) -> Result<FileKind, Errno> {
+        let node = cx.get(id).ok_or(Errno::ENOENT)?;
+        let kind = node.read().kind;
+        Ok(kind)
+    }
+
     /// Records `id` under `name` in directory `parent` and bumps its times.
-    fn link_into(
-        cx: &mut Cx<'_, Node>,
-        parent: NodeId,
-        name: &str,
-        entry: DirEntry,
-        now: SystemTime,
-    ) {
-        if let Some(node) = cx.get_mut(parent) {
+    fn link_into(cx: &Cx<'_, Node>, parent: NodeId, name: &str, entry: DirEntry, now: SystemTime) {
+        if let Some(node) = cx.get(parent) {
+            let mut node = node.write();
             if let Content::Dir(entries) = &mut node.content {
                 entries.insert(name.to_string(), entry);
             }
@@ -150,7 +176,7 @@ impl MemoryFs {
     #[allow(clippy::too_many_arguments)]
     fn create_child(
         &self,
-        cx: &mut Cx<'_, Node>,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         kind: FileKind,
@@ -182,11 +208,12 @@ impl NodeFs for MemoryFs {
         )
     }
 
-    fn getattr(&mut self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
-        Ok(node.attr())
+    fn getattr(&self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
+        Ok(node.read().attr())
     }
 
-    fn setattr(&mut self, node: &mut Node, set: &SetAttr, _c: &Caller) -> Result<NodeAttr, Errno> {
+    fn setattr(&self, node: &Node, set: &SetAttr, _c: &Caller) -> Result<NodeAttr, Errno> {
+        let mut node = node.write();
         let now = SystemTime::now();
         let mut changed = false;
 
@@ -231,7 +258,8 @@ impl NodeFs for MemoryFs {
         Ok(node.attr())
     }
 
-    fn readlink(&mut self, node: &Node, _c: &Caller) -> Result<String, Errno> {
+    fn readlink(&self, node: &Node, _c: &Caller) -> Result<String, Errno> {
+        let node = node.read();
         match &node.content {
             Content::Symlink(target) => Ok(target.clone()),
             _ => Err(Errno::EINVAL),
@@ -239,25 +267,22 @@ impl NodeFs for MemoryFs {
     }
 
     fn lookup(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         _c: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
-        match cx.get(parent) {
-            Some(Node {
-                content: Content::Dir(entries),
-                ..
-            }) => Ok(entries.get(name).map(|entry| entry.id)),
-            Some(_) => Err(Errno::ENOTDIR),
-            None => Err(Errno::ENOENT),
+        match Self::entry(cx, parent, name) {
+            Ok(entry) => Ok(Some(entry.id)),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
     fn mknod(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         mode: u32,
@@ -273,12 +298,20 @@ impl NodeFs for MemoryFs {
             x if x == libc::S_IFBLK as u32 => (FileKind::BlockDevice, Content::Special),
             _ => return Err(Errno::EINVAL),
         };
-        self.create_child(cx, parent, name, kind, content, (mode & 0o7777) as u16, rdev)
+        self.create_child(
+            cx,
+            parent,
+            name,
+            kind,
+            content,
+            (mode & 0o7777) as u16,
+            rdev,
+        )
     }
 
     fn mkdir(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         mode: u32,
@@ -297,8 +330,8 @@ impl NodeFs for MemoryFs {
     }
 
     fn symlink(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         target: &str,
@@ -316,8 +349,8 @@ impl NodeFs for MemoryFs {
     }
 
     fn create(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         mode: u32,
@@ -338,35 +371,26 @@ impl NodeFs for MemoryFs {
     }
 
     fn unlink(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         _c: &Caller,
     ) -> Result<(), Errno> {
-        let id = match cx.get(parent) {
-            Some(Node {
-                content: Content::Dir(entries),
-                ..
-            }) => entries.get(name).ok_or(Errno::ENOENT)?.id,
-            Some(_) => return Err(Errno::ENOTDIR),
-            None => return Err(Errno::ENOENT),
-        };
-        if matches!(cx.get(id), Some(n) if n.kind == FileKind::Directory) {
+        let id = Self::entry(cx, parent, name)?.id;
+        if Self::kind(cx, id)? == FileKind::Directory {
             return Err(Errno::EISDIR);
         }
         let now = SystemTime::now();
-        if let Some(Node {
-            content: Content::Dir(entries),
-            ..
-        }) = cx.get_mut(parent)
-        {
-            entries.remove(name);
-        }
-        if let Some(node) = cx.get_mut(parent) {
+        if let Some(node) = cx.get(parent) {
+            let mut node = node.write();
+            if let Content::Dir(entries) = &mut node.content {
+                entries.remove(name);
+            }
             node.touch(now);
         }
-        if let Some(node) = cx.get_mut(id) {
+        if let Some(node) = cx.get(id) {
+            let mut node = node.write();
             node.nlink = node.nlink.saturating_sub(1);
             node.ctime = now;
         }
@@ -375,45 +399,30 @@ impl NodeFs for MemoryFs {
     }
 
     fn rmdir(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         _c: &Caller,
     ) -> Result<(), Errno> {
-        let id = match cx.get(parent) {
-            Some(Node {
-                content: Content::Dir(entries),
-                ..
-            }) => entries.get(name).ok_or(Errno::ENOENT)?.id,
-            Some(_) => return Err(Errno::ENOTDIR),
-            None => return Err(Errno::ENOENT),
-        };
-        match cx.get(id) {
-            Some(Node {
-                content: Content::Dir(entries),
-                ..
-            }) => {
-                if !entries.is_empty() {
-                    return Err(Errno::ENOTEMPTY);
-                }
-            }
-            Some(_) => return Err(Errno::ENOTDIR),
-            None => return Err(Errno::ENOENT),
+        let id = Self::entry(cx, parent, name)?.id;
+        let child = cx.get(id).ok_or(Errno::ENOENT)?;
+        match &child.read().content {
+            Content::Dir(entries) if entries.is_empty() => {}
+            Content::Dir(_) => return Err(Errno::ENOTEMPTY),
+            _ => return Err(Errno::ENOTDIR),
         }
         let now = SystemTime::now();
-        if let Some(Node {
-            content: Content::Dir(entries),
-            ..
-        }) = cx.get_mut(parent)
-        {
-            entries.remove(name);
-        }
-        if let Some(node) = cx.get_mut(parent) {
+        if let Some(node) = cx.get(parent) {
+            let mut node = node.write();
+            if let Content::Dir(entries) = &mut node.content {
+                entries.remove(name);
+            }
             node.nlink = node.nlink.saturating_sub(1);
             node.touch(now);
         }
-        if let Some(node) = cx.get_mut(id) {
+        if let Some(node) = cx.get(id) {
+            let mut node = node.write();
             node.nlink = 0;
             node.ctime = now;
         }
@@ -422,8 +431,8 @@ impl NodeFs for MemoryFs {
     }
 
     fn rename(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         newparent: NodeId,
@@ -431,32 +440,24 @@ impl NodeFs for MemoryFs {
         _flags: u32,
         _c: &Caller,
     ) -> Result<(), Errno> {
-        let target = match cx.get(parent) {
-            Some(Node {
-                content: Content::Dir(entries),
-                ..
-            }) => entries.get(name).ok_or(Errno::ENOENT)?.id,
-            Some(_) => return Err(Errno::ENOTDIR),
-            None => return Err(Errno::ENOENT),
-        };
-        let target_kind = cx.get(target).map(|node| node.kind).ok_or(Errno::ENOENT)?;
+        let target = Self::entry(cx, parent, name)?.id;
+        let target_kind = Self::kind(cx, target)?;
         let target_is_dir = target_kind == FileKind::Directory;
 
         // Inspect any entry being replaced at the destination.
-        let existing = match cx.get(newparent) {
-            Some(Node {
-                content: Content::Dir(entries),
-                ..
-            }) => entries.get(newname).copied(),
-            Some(_) => return Err(Errno::ENOTDIR),
-            None => return Err(Errno::ENOENT),
+        let existing = match Self::entry(cx, newparent, newname) {
+            Ok(v) => Some(v),
+            Err(Errno::ENOENT) => None,
+            Err(e) => return Err(e),
         };
         if let Some(existing_entry) = existing {
             if existing_entry.id == target {
                 return Ok(());
             }
-            match cx.get(existing_entry.id).map(|n| &n.content) {
-                Some(Content::Dir(entries)) => {
+            let existing_node = cx.get(existing_entry.id).ok_or(Errno::ENOENT)?;
+            let existing_node = existing_node.read();
+            match &existing_node.content {
+                Content::Dir(entries) => {
                     if !target_is_dir {
                         return Err(Errno::EISDIR);
                     }
@@ -473,50 +474,53 @@ impl NodeFs for MemoryFs {
         }
 
         let now = SystemTime::now();
-        if let Some(Node {
-            content: Content::Dir(entries),
-            ..
-        }) = cx.get_mut(parent)
-        {
-            entries.remove(name);
-        }
-        if let Some(node) = cx.get_mut(parent) {
+        if let Some(node) = cx.get(parent) {
+            let mut node = node.write();
+            if let Content::Dir(entries) = &mut node.content {
+                entries.remove(name);
+            }
             node.touch(now);
         }
-        let replaced = if let Some(Node {
-            content: Content::Dir(entries),
-            ..
-        }) = cx.get_mut(newparent)
-        {
-            entries.insert(
-                newname.to_string(),
-                DirEntry {
-                    id: target,
-                    kind: target_kind,
-                },
-            )
+        let replaced = if let Some(node) = cx.get(newparent) {
+            let mut node = node.write();
+            if let Content::Dir(entries) = &mut node.content {
+                entries.insert(
+                    newname.to_string(),
+                    DirEntry {
+                        id: target,
+                        kind: target_kind,
+                    },
+                )
+            } else {
+                return Err(Errno::ENOTDIR);
+            }
         } else {
             None
         };
-        if let Some(node) = cx.get_mut(newparent) {
+        if let Some(node) = cx.get(newparent) {
+            let mut node = node.write();
             node.touch(now);
         }
         if target_is_dir && parent != newparent {
             cx.reparent(target, newparent);
-            if let Some(node) = cx.get_mut(parent) {
+            if let Some(node) = cx.get(parent) {
+                let mut node = node.write();
                 node.nlink = node.nlink.saturating_sub(1);
             }
-            if let Some(node) = cx.get_mut(newparent) {
+            if let Some(node) = cx.get(newparent) {
+                let mut node = node.write();
                 node.nlink += 1;
             }
         }
         if let Some(replaced_entry) = replaced {
             if replaced_entry.kind == FileKind::Directory {
-                if let Some(node) = cx.get_mut(newparent) {
+                if let Some(node) = cx.get(newparent) {
+                    let mut node = node.write();
                     node.nlink = node.nlink.saturating_sub(1);
                 }
             }
-            if let Some(node) = cx.get_mut(replaced_entry.id) {
+            if let Some(node) = cx.get(replaced_entry.id) {
+                let mut node = node.write();
                 if replaced_entry.kind == FileKind::Directory {
                     node.nlink = 0;
                 } else {
@@ -530,43 +534,45 @@ impl NodeFs for MemoryFs {
     }
 
     fn link(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         id: NodeId,
         newparent: NodeId,
         newname: &str,
         _c: &Caller,
     ) -> Result<NodeId, Errno> {
-        if matches!(cx.get(id), Some(n) if n.kind == FileKind::Directory) {
+        if Self::kind(cx, id)? == FileKind::Directory {
             return Err(Errno::EPERM);
         }
         Self::check_new_entry(cx, newparent, newname)?;
         let now = SystemTime::now();
-        let kind = cx.get(id).map(|node| node.kind).ok_or(Errno::ENOENT)?;
+        let kind = Self::kind(cx, id)?;
         Self::link_into(cx, newparent, newname, DirEntry { id, kind }, now);
         cx.add_link(id);
-        if let Some(node) = cx.get_mut(id) {
+        if let Some(node) = cx.get(id) {
+            let mut node = node.write();
             node.nlink += 1;
             node.ctime = now;
         }
         Ok(id)
     }
 
-    fn open(&mut self, node: &mut Node, _flags: i32, _c: &Caller) -> Result<Opened<()>, Errno> {
-        if node.kind == FileKind::Directory {
+    fn open(&self, node: &Node, _flags: i32, _c: &Caller) -> Result<Opened<()>, Errno> {
+        if node.read().kind == FileKind::Directory {
             return Err(Errno::EISDIR);
         }
         Ok(Opened::new(()))
     }
 
     fn read<'a>(
-        &'a mut self,
-        node: &'a mut Node,
-        _h: &'a mut (),
+        &'a self,
+        node: &'a Node,
+        _h: &'a (),
         offset: u64,
         size: usize,
         _c: &Caller,
     ) -> Result<Cow<'a, [u8]>, Errno> {
+        let node = node.read();
         let Content::File(content) = &node.content else {
             return Err(Errno::EISDIR);
         };
@@ -575,18 +581,19 @@ impl NodeFs for MemoryFs {
             return Ok(Cow::Borrowed(&[]));
         }
         let end = (offset + size).min(content.len());
-        Ok(Cow::Borrowed(&content[offset..end]))
+        Ok(Cow::Owned(content[offset..end].to_vec()))
     }
 
     fn write(
-        &mut self,
-        node: &mut Node,
-        _h: &mut (),
+        &self,
+        node: &Node,
+        _h: &(),
         data: &[u8],
         offset: u64,
         _c: &Caller,
     ) -> Result<usize, Errno> {
         let now = SystemTime::now();
+        let mut node = node.write();
         let Content::File(content) = &mut node.content else {
             return Err(Errno::EISDIR);
         };
@@ -601,15 +608,16 @@ impl NodeFs for MemoryFs {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         node: &Node,
         this: NodeId,
         parent: NodeId,
-        _dh: &mut (),
+        _dh: &(),
         offset: u64,
         sink: &mut dyn DirSink,
         _c: &Caller,
     ) -> Result<(), Errno> {
+        let node = node.read();
         let Content::Dir(entries) = &node.content else {
             return Err(Errno::ENOTDIR);
         };
@@ -642,13 +650,14 @@ impl NodeFs for MemoryFs {
     // xattr op makes the kernel spill to AppleDouble "._*" sidecar files). ---
 
     fn setxattr(
-        &mut self,
-        node: &mut Node,
+        &self,
+        node: &Node,
         name: &str,
         value: &[u8],
         flags: i32,
         _c: &Caller,
     ) -> Result<(), Errno> {
+        let mut node = node.write();
         let exists = node.xattrs.contains_key(name);
         if flags & libc::XATTR_CREATE != 0 && exists {
             return Err(Errno::EEXIST);
@@ -662,12 +671,13 @@ impl NodeFs for MemoryFs {
     }
 
     fn getxattr(
-        &mut self,
+        &self,
         node: &Node,
         name: &str,
         size: usize,
         _c: &Caller,
     ) -> Result<fuse3::XattrReply, Errno> {
+        let node = node.read();
         let value = node.xattrs.get(name).ok_or(Errno::ENODATA)?;
         if size == 0 {
             Ok(fuse3::XattrReply::Size(value.len()))
@@ -676,12 +686,8 @@ impl NodeFs for MemoryFs {
         }
     }
 
-    fn listxattr(
-        &mut self,
-        node: &Node,
-        size: usize,
-        _c: &Caller,
-    ) -> Result<fuse3::XattrReply, Errno> {
+    fn listxattr(&self, node: &Node, size: usize, _c: &Caller) -> Result<fuse3::XattrReply, Errno> {
+        let node = node.read();
         let mut names = Vec::new();
         for name in node.xattrs.keys() {
             names.extend_from_slice(name.as_bytes());
@@ -694,7 +700,8 @@ impl NodeFs for MemoryFs {
         }
     }
 
-    fn removexattr(&mut self, node: &mut Node, name: &str, _c: &Caller) -> Result<(), Errno> {
+    fn removexattr(&self, node: &Node, name: &str, _c: &Caller) -> Result<(), Errno> {
+        let mut node = node.write();
         node.xattrs.remove(name).ok_or(Errno::ENODATA)?;
         node.ctime = SystemTime::now();
         Ok(())
@@ -725,13 +732,7 @@ mod tests {
     struct Entries(Vec<(String, FileKind)>);
 
     impl DirSink for Entries {
-        fn add(
-            &mut self,
-            name: &str,
-            _id: NodeId,
-            kind: FileKind,
-            _next_offset: u64,
-        ) -> bool {
+        fn add(&mut self, name: &str, _id: NodeId, kind: FileKind, _next_offset: u64) -> bool {
             self.0.push((name.to_string(), kind));
             true
         }
@@ -739,7 +740,7 @@ mod tests {
 
     #[test]
     fn directory_link_counts_follow_child_directories() {
-        let mut rt = Runtime::new(MemoryFs::new());
+        let rt = Runtime::new(MemoryFs::new());
         let caller = Caller::default();
 
         assert_eq!(rt.getattr(NodeId::ROOT.ino(), &caller).unwrap().nlink, 2);
@@ -755,7 +756,7 @@ mod tests {
 
     #[test]
     fn readdir_reports_each_entry_kind() {
-        let mut rt = Runtime::new(MemoryFs::new());
+        let rt = Runtime::new(MemoryFs::new());
         let caller = Caller::default();
         rt.mkdir(NodeId::ROOT.ino(), "dir", 0o755, 0, &caller)
             .unwrap();
@@ -766,19 +767,11 @@ mod tests {
 
         let open = rt.opendir(NodeId::ROOT.ino(), 0, &caller).unwrap();
         let mut entries = Entries::default();
-        rt.readdir(
-            NodeId::ROOT.ino(),
-            open.fh,
-            0,
-            &mut entries,
-            &caller,
-        )
-        .unwrap();
+        rt.readdir(NodeId::ROOT.ino(), open.fh, 0, &mut entries, &caller)
+            .unwrap();
 
         assert!(entries.0.contains(&("dir".into(), FileKind::Directory)));
         assert!(entries.0.contains(&("link".into(), FileKind::Symlink)));
-        assert!(entries
-            .0
-            .contains(&("file".into(), FileKind::RegularFile)));
+        assert!(entries.0.contains(&("file".into(), FileKind::RegularFile)));
     }
 }

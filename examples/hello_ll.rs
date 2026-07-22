@@ -279,7 +279,11 @@ mod imp {
             .map(|a| a.to_string_lossy().into_owned())
             .unwrap_or_else(|| "hello_ll".to_string());
 
-        if unsafe { fuse_parse_cmdline_30(&mut args, &mut opts) } != 0 {
+        #[cfg(feature = "fuse_312")]
+        let parse_result = unsafe { fuse_parse_cmdline_312(&mut args, &mut opts) };
+        #[cfg(not(feature = "fuse_312"))]
+        let parse_result = unsafe { fuse_parse_cmdline_30(&mut args, &mut opts) };
+        if parse_result != 0 {
             return 1;
         }
 

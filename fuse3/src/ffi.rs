@@ -99,6 +99,7 @@ pub(crate) fn apply_open(fi: *mut fuse_file_info, fh: u64, hints: OpenHints) {
         (*fi).set_keep_cache(hints.keep_cache as u32);
         (*fi).set_nonseekable(hints.nonseekable as u32);
         (*fi).set_cache_readdir(hints.cache_readdir as u32);
+        (*fi).set_parallel_direct_writes((hints.direct_io && hints.parallel_direct_writes) as u32);
     }
 }
 
@@ -108,12 +109,14 @@ pub(crate) fn apply_open(fi: *mut fuse_file_info, fh: u64, hints: OpenHints) {
 /// [`ConnInfo`].
 pub(crate) fn conn_read(conn: *mut fuse_conn_info) -> ConnInfo {
     unsafe {
-        ConnInfo {
-            proto_major: (*conn).proto_major,
-            proto_minor: (*conn).proto_minor,
-            max_write: (*conn).max_write,
-            max_readahead: (*conn).max_readahead,
-        }
+        ConnInfo::from_raw(
+            (*conn).proto_major,
+            (*conn).proto_minor,
+            (*conn).max_write,
+            (*conn).max_readahead,
+            (*conn).capable,
+            (*conn).want,
+        )
     }
 }
 
@@ -122,6 +125,7 @@ pub(crate) fn conn_apply(conn: *mut fuse_conn_info, info: &ConnInfo) {
     unsafe {
         (*conn).max_write = info.max_write;
         (*conn).max_readahead = info.max_readahead;
+        (*conn).want = info.want_bits();
     }
 }
 
@@ -237,5 +241,50 @@ impl DirSink for DirBuffer {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use typed_fuse_core::ConnectionCapability;
+
+    #[test]
+    fn parallel_direct_writes_requires_direct_io() {
+        let mut fi: fuse_file_info = unsafe { std::mem::zeroed() };
+        apply_open(
+            &mut fi,
+            7,
+            OpenHints {
+                parallel_direct_writes: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(fi.parallel_direct_writes(), 0);
+        apply_open(
+            &mut fi,
+            8,
+            OpenHints {
+                direct_io: true,
+                parallel_direct_writes: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(fi.fh, 8);
+        assert_eq!(fi.parallel_direct_writes(), 1);
+    }
+
+    #[test]
+    fn capability_update_preserves_unrelated_want_bits() {
+        let mut raw: fuse_conn_info = unsafe { std::mem::zeroed() };
+        raw.capable = (1 << 0) | (1 << 18) | (1 << 10);
+        raw.want = (1 << 0) | (1 << 10);
+        let mut info = conn_read(&mut raw);
+        assert!(info.set_enabled(ConnectionCapability::ParallelDirectoryOperations, true));
+        assert!(info.set_enabled(ConnectionCapability::AsyncRead, false));
+        conn_apply(&mut raw, &info);
+        assert_eq!(raw.want & (1 << 10), 1 << 10);
+        assert_eq!(raw.want & (1 << 18), 1 << 18);
+        assert_eq!(raw.want & 1, 0);
     }
 }

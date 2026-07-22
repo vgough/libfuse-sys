@@ -4,7 +4,7 @@
 //! by hand: inode identity and allocation, node lifetime (lookup / hard-link
 //! / open-handle refcounts and deferred deletion), and the file-handle
 //! table. Authors implement the [`NodeFs`] trait against their own node and
-//! handle payload types; operations receive resolved `&mut Node` / handle
+//! handle payload types; operations receive shared node / handle
 //! objects instead of raw inode numbers and integer file handles.
 //!
 //! It contains no raw C types and does not depend on `libfuse-sys`; the
@@ -20,6 +20,6 @@ mod runtime;
 pub use attr::{FileKind, NodeAttr, SetAttr, StatFs, TimeOrNow};
 pub use errno::Errno;
 pub use node_fs::{
-    Caller, ConnInfo, DirSink, NodeFs, NodeId, OpenHints, Opened, XattrReply,
+    Caller, ConnInfo, ConnectionCapability, DirSink, NodeFs, NodeId, OpenHints, Opened, XattrReply,
 };
-pub use runtime::{Cx, EntryReply, LookupReply, NodeTable, OpenReply, Runtime};
+pub use runtime::{Cx, EntryReply, LookupReply, NodeRef, NodeTable, OpenReply, Runtime};

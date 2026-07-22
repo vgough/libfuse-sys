@@ -1,4 +1,7 @@
-.PHONY: hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean
+.PHONY: test hello_ll memory_fs run_memory_fs memory_fs_release benchmark benchmark-save-baseline clean
+
+test:
+	cargo test --workspace
 
 hello_ll:
 	cargo build --example hello_ll --features fuse_35
@@ -20,7 +23,7 @@ MPIRUN_BIN ?= mpirun
 BENCH_MOUNT_TIMEOUT_SECS ?= 30
 
 benchmark: memory_fs_release
-	test -f '$(BENCH_BASELINE)' || (echo "Benchmark baseline $(BENCH_BASELINE) is missing; run 'make benchmark-save-baseline' first" >&2; exit 1)
+	test -f 'fuse3/$(BENCH_BASELINE)' || (echo "Benchmark baseline fuse3/$(BENCH_BASELINE) is missing; run 'make benchmark-save-baseline' first" >&2; exit 1)
 	BENCH_BASELINE='$(BENCH_BASELINE)' BENCH_ITEMS='$(BENCH_ITEMS)' \
 		BENCH_ITERATIONS='$(BENCH_ITERATIONS)' BENCH_PROCS='$(BENCH_PROCS)' \
 		BENCH_BYTES='$(BENCH_BYTES)' MDTEST_BIN='$(MDTEST_BIN)' \

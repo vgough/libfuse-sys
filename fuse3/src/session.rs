@@ -4,10 +4,8 @@
 //!
 //! # Threading
 //!
-//! `fuse_session_loop` (used by [`Session::run`]) processes requests strictly
-//! one at a time, so at most one trampoline is ever executing for a given
-//! runtime. That is what makes it sound to recover a `&mut Runtime<F>` from
-//! the raw `userdata`/`req` pointer in every shim.
+//! Trampolines recover a shared [`Runtime`] reference. Its metadata is
+//! synchronized internally, and [`NodeFs`] requires thread-safe payloads.
 //!
 //! # Panics
 //!
@@ -29,19 +27,26 @@
 //! reinterprets.
 
 use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
+use std::rc::Rc;
 use std::time::Duration;
 
 use libfuse_sys::fuse_lowlevel::{
     dev_t, fuse_args, fuse_conn_info, fuse_ctx, fuse_entry_param, fuse_file_info, fuse_forget_data,
-    fuse_ino_t, fuse_lowlevel_ops, fuse_opt_free_args, fuse_remove_signal_handlers,
-    fuse_reply_buf, fuse_reply_err, fuse_reply_lseek, fuse_reply_none, fuse_reply_open,
-    fuse_reply_readlink, fuse_reply_write, fuse_reply_xattr, fuse_req_ctx, fuse_req_t,
-    fuse_req_userdata, fuse_session, fuse_session_destroy, fuse_session_loop, fuse_session_mount,
-    fuse_session_new_versioned, fuse_session_unmount, fuse_set_signal_handlers, libfuse_version,
-    mode_t, off_t, stat, FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION,
+    fuse_ino_t, fuse_lowlevel_ops, fuse_opt_free_args, fuse_remove_signal_handlers, fuse_reply_buf,
+    fuse_reply_err, fuse_reply_lseek, fuse_reply_none, fuse_reply_open, fuse_reply_readlink,
+    fuse_reply_write, fuse_reply_xattr, fuse_req_ctx, fuse_req_t, fuse_req_userdata, fuse_session,
+    fuse_session_destroy, fuse_session_loop, fuse_session_mount, fuse_session_new_versioned,
+    fuse_session_unmount, fuse_set_signal_handlers, libfuse_version, mode_t, off_t, stat,
+    FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION,
+};
+use libfuse_sys::fuse_lowlevel::{
+    fuse_loop_config, loop_cfg_create_312, loop_cfg_destroy_312, loop_cfg_set_clone_fd_312,
+    loop_cfg_set_idle_threads_312, loop_cfg_set_max_threads_312, session_loop_mt_312,
 };
 
 #[cfg(target_os = "macos")]
@@ -120,8 +125,8 @@ fn raw_reply_statfs(req: fuse_req_t, stbuf: *const statvfs) -> c_int {
 /// Recovers the `Runtime<F>` associated with an in-flight request. Sound
 /// because `fuse_session_loop` processes requests sequentially (see module
 /// docs).
-fn holder_of<'a, F: NodeFs>(req: fuse_req_t) -> &'a mut Runtime<F> {
-    unsafe { &mut *(fuse_req_userdata(req) as *mut Runtime<F>) }
+fn holder_of<'a, F: NodeFs>(req: fuse_req_t) -> &'a Runtime<F> {
+    unsafe { &*(fuse_req_userdata(req) as *const Runtime<F>) }
 }
 
 /// Extracts the calling process's credentials from a request.
@@ -172,9 +177,9 @@ fn catch_unwind_unit(f: impl FnOnce()) {
 /// under [`catch_unwind`]. The runtime reference is handed to `f` at the
 /// caller-chosen lifetime `'a` so that borrowing return values (`read`'s
 /// `Cow`) can flow out through `R`.
-fn call_fs<'a, F: NodeFs + 'a, R>(
+fn call_fs<F: NodeFs, R>(
     req: fuse_req_t,
-    f: impl FnOnce(&'a mut Runtime<F>, &Caller) -> Result<R, Errno>,
+    f: impl FnOnce(&Runtime<F>, &Caller) -> Result<R, Errno>,
 ) -> Result<R, Errno> {
     let rt = holder_of::<F>(req);
     let caller = caller_of(req);
@@ -241,14 +246,14 @@ fn reply_xattr(req: fuse_req_t, reply: &XattrReply, requested_size: usize) {
 // ---------------------------------------------------------------------
 
 unsafe extern "C" fn init_shim<F: NodeFs>(userdata: *mut c_void, conn: *mut fuse_conn_info) {
-    let rt = unsafe { &mut *(userdata as *mut Runtime<F>) };
+    let rt = unsafe { &*(userdata as *const Runtime<F>) };
     let mut info = conn_read(conn);
     catch_unwind_unit(|| rt.init(&mut info));
     conn_apply(conn, &info);
 }
 
 unsafe extern "C" fn destroy_shim<F: NodeFs>(userdata: *mut c_void) {
-    let rt = unsafe { &mut *(userdata as *mut Runtime<F>) };
+    let rt = unsafe { &*(userdata as *const Runtime<F>) };
     catch_unwind_unit(|| rt.destroy());
 }
 
@@ -423,7 +428,9 @@ unsafe extern "C" fn rename_shim<F: NodeFs>(
 ) {
     let name = try_name!(req, name);
     let newname = try_name!(req, newname);
-    match call_fs::<F, _>(req, |rt, c| rt.rename(parent, name, newparent, newname, flags, c)) {
+    match call_fs::<F, _>(req, |rt, c| {
+        rt.rename(parent, name, newparent, newname, flags, c)
+    }) {
         Ok(()) => reply_ok(req),
         Err(e) => reply_err(req, e),
     }
@@ -465,12 +472,19 @@ unsafe extern "C" fn read_shim<F: NodeFs>(
     fi: *mut fuse_file_info,
 ) {
     let fh = fi_fh(fi);
-    match call_fs::<F, _>(req, |rt, c| rt.read(ino, fh, off as u64, size, c)) {
-        Ok(data) => {
-            let len = data.len().min(size);
-            unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
-        }
-        Err(e) => reply_err(req, e),
+    let rt = holder_of::<F>(req);
+    let caller = caller_of(req);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        rt.read(ino, fh, off as u64, size, &caller, |result| match result {
+            Ok(data) => {
+                let len = data.len().min(size);
+                unsafe { fuse_reply_buf(req, data[..len].as_ptr() as *const c_char, len) };
+            }
+            Err(e) => reply_err(req, e),
+        })
+    }));
+    if result.is_err() {
+        reply_err(req, Errno::EIO);
     }
 }
 
@@ -785,7 +799,15 @@ unsafe extern "C" fn copy_file_range_shim<F: NodeFs>(
     flags: c_int,
 ) {
     match call_fs::<F, _>(req, |rt, c| {
-        rt.copy_file_range(ino_in, off_in as u64, ino_out, off_out as u64, len as u64, flags, c)
+        rt.copy_file_range(
+            ino_in,
+            off_in as u64,
+            ino_out,
+            off_out as u64,
+            len as u64,
+            flags,
+            c,
+        )
     }) {
         Ok(count) => {
             unsafe { fuse_reply_write(req, count) };
@@ -886,6 +908,8 @@ pub enum Error {
     SignalHandlers,
     Loop(i32),
     InvalidMountpoint(String),
+    InvalidThreadPool(String),
+    LoopConfigAllocation,
 }
 
 impl std::fmt::Display for Error {
@@ -898,30 +922,119 @@ impl std::fmt::Display for Error {
             Error::InvalidMountpoint(mp) => {
                 write!(f, "invalid mountpoint (contains a NUL byte): {mp:?}")
             }
+            Error::InvalidThreadPool(message) => write!(f, "invalid thread pool: {message}"),
+            Error::LoopConfigAllocation => write!(f, "failed to allocate libfuse loop config"),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
+/// Runtime dispatch configuration for a FUSE session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionConfig {
+    pub threading: ThreadingMode,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            threading: ThreadingMode::MultiThreaded(ThreadPoolConfig::default()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadingMode {
+    SingleThreaded,
+    MultiThreaded(ThreadPoolConfig),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadPoolConfig {
+    pub max_threads: NonZeroU32,
+    pub max_idle_threads: Option<u32>,
+    pub clone_fd: bool,
+}
+
+impl Default for ThreadPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_threads: NonZeroU32::new(10).unwrap(),
+            max_idle_threads: None,
+            clone_fd: false,
+        }
+    }
+}
+
+impl ThreadPoolConfig {
+    const MAX_THREADS: u32 = 100_000;
+    fn validate(self) -> Result<Self, Error> {
+        if self.max_threads.get() > Self::MAX_THREADS {
+            return Err(Error::InvalidThreadPool(format!(
+                "max_threads exceeds {}",
+                Self::MAX_THREADS
+            )));
+        }
+        Ok(self)
+    }
+}
+
+struct LoopConfig(*mut fuse_loop_config);
+impl LoopConfig {
+    fn new(pool: ThreadPoolConfig) -> Result<Self, Error> {
+        let pool = pool.validate()?;
+        let raw = unsafe { loop_cfg_create_312() };
+        if raw.is_null() {
+            return Err(Error::LoopConfigAllocation);
+        }
+        unsafe {
+            loop_cfg_set_max_threads_312(raw, pool.max_threads.get());
+            if let Some(idle) = pool.max_idle_threads {
+                loop_cfg_set_idle_threads_312(raw, idle);
+            }
+            loop_cfg_set_clone_fd_312(raw, pool.clone_fd as u32);
+        }
+        Ok(Self(raw))
+    }
+}
+impl Drop for LoopConfig {
+    fn drop(&mut self) {
+        unsafe { loop_cfg_destroy_312(self.0) }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------
 
 /// A mounted (or mountable) FUSE session driving a single [`NodeFs`]
-/// implementation, single-threaded, via `fuse_session_loop`. `!Send` by
-/// virtue of its raw pointer fields.
+/// implementation with configurable dispatch. The session is intentionally
+/// `!Send`; libfuse worker threads only share its synchronized runtime.
 pub struct Session<F: NodeFs> {
     session: *mut fuse_session,
     runtime: *mut Runtime<F>,
     mounted: bool,
     _arg_storage: Vec<CString>,
+    config: SessionConfig,
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl<F: NodeFs> Session<F> {
     /// Creates a new (not-yet-mounted) session for `fs`, configured with
     /// `options`. The root node is seeded from [`NodeFs::root`].
     pub fn new(fs: F, options: &[MountOption]) -> Result<Self, Error> {
+        Self::new_with_config(fs, options, SessionConfig::default())
+    }
+
+    pub fn new_with_config(
+        fs: F,
+        options: &[MountOption],
+        config: SessionConfig,
+    ) -> Result<Self, Error> {
+        if let ThreadingMode::MultiThreaded(pool) = config.threading {
+            pool.validate()?;
+        }
         let mut arg_strings = vec!["fuse3".to_string()];
         if !options.is_empty() {
             let rendered = options
@@ -957,7 +1070,10 @@ impl<F: NodeFs> Session<F> {
         #[cfg(target_os = "macos")]
         version.set_darwin_extensions_enabled(0);
 
-        let runtime: *mut Runtime<F> = Box::into_raw(Box::new(Runtime::new(fs)));
+        let mut runtime_value = Runtime::new(fs);
+        runtime_value
+            .set_parallel_dirops(matches!(config.threading, ThreadingMode::MultiThreaded(_)));
+        let runtime: *mut Runtime<F> = Box::into_raw(Box::new(runtime_value));
 
         let session = unsafe {
             fuse_session_new_versioned(
@@ -981,6 +1097,8 @@ impl<F: NodeFs> Session<F> {
             runtime,
             mounted: false,
             _arg_storage: arg_cstrings,
+            config,
+            _not_send: PhantomData,
         })
     }
 
@@ -996,12 +1114,21 @@ impl<F: NodeFs> Session<F> {
         Ok(())
     }
 
-    /// Runs the single-threaded event loop until unmounted or signalled.
+    /// Runs the configured event loop until unmounted or signalled.
     pub fn run(&mut self) -> Result<(), Error> {
         if unsafe { fuse_set_signal_handlers(self.session) } != 0 {
             return Err(Error::SignalHandlers);
         }
-        let rc = unsafe { fuse_session_loop(self.session) };
+        let rc = match self.config.threading {
+            ThreadingMode::SingleThreaded => unsafe { fuse_session_loop(self.session) },
+            ThreadingMode::MultiThreaded(pool) => match LoopConfig::new(pool) {
+                Ok(config) => unsafe { session_loop_mt_312(self.session, config.0) },
+                Err(error) => {
+                    unsafe { fuse_remove_signal_handlers(self.session) };
+                    return Err(error);
+                }
+            },
+        };
         unsafe { fuse_remove_signal_handlers(self.session) };
         if rc != 0 {
             return Err(Error::Loop(rc));
@@ -1012,6 +1139,17 @@ impl<F: NodeFs> Session<F> {
     /// Convenience: [`Session::new`] + [`Session::mount`] + [`Session::run`].
     pub fn mount_and_run(fs: F, mountpoint: &str, options: &[MountOption]) -> Result<(), Error> {
         let mut session = Session::new(fs, options)?;
+        session.mount(mountpoint)?;
+        session.run()
+    }
+
+    pub fn mount_and_run_with_config(
+        fs: F,
+        mountpoint: &str,
+        options: &[MountOption],
+        config: SessionConfig,
+    ) -> Result<(), Error> {
+        let mut session = Session::new_with_config(fs, options, config)?;
         session.mount(mountpoint)?;
         session.run()
     }
@@ -1044,7 +1182,7 @@ mod tests {
         type Handle = ();
         type DirHandle = ();
         fn root(&mut self) {}
-        fn getattr(&mut self, _n: &(), _c: &Caller) -> Result<NodeAttr, Errno> {
+        fn getattr(&self, _n: &(), _c: &Caller) -> Result<NodeAttr, Errno> {
             Ok(NodeAttr::default())
         }
     }
@@ -1113,11 +1251,38 @@ mod tests {
             MountOption::DefaultPermissions.render(),
             "default_permissions"
         );
-        assert_eq!(MountOption::FsName("myfs".to_string()).render(), "fsname=myfs");
+        assert_eq!(
+            MountOption::FsName("myfs".to_string()).render(),
+            "fsname=myfs"
+        );
         assert_eq!(
             MountOption::Subtype("fuse.myfs".to_string()).render(),
             "subtype=fuse.myfs"
         );
-        assert_eq!(MountOption::Custom("noatime".to_string()).render(), "noatime");
+        assert_eq!(
+            MountOption::Custom("noatime".to_string()).render(),
+            "noatime"
+        );
+    }
+
+    #[test]
+    fn session_config_defaults_to_libfuse_pool_defaults() {
+        assert_eq!(
+            SessionConfig::default().threading,
+            ThreadingMode::MultiThreaded(ThreadPoolConfig {
+                max_threads: NonZeroU32::new(10).unwrap(),
+                max_idle_threads: None,
+                clone_fd: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_pool_above_libfuse_ceiling() {
+        let pool = ThreadPoolConfig {
+            max_threads: NonZeroU32::new(100_001).unwrap(),
+            ..Default::default()
+        };
+        assert!(matches!(pool.validate(), Err(Error::InvalidThreadPool(_))));
     }
 }

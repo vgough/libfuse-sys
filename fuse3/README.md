@@ -10,7 +10,7 @@ none of it.
 
 ## What you get
 
-- A `Filesystem` trait with methods like `lookup`, `getattr`, `read`, `write`, `readdir`,
+- A `NodeFs` trait with methods like `lookup`, `getattr`, `read`, `write`, `readdir`,
   ... that take and return plain `std` types (`&str`, `Vec<u8>`, `SystemTime`,
   `Result<T, Errno>`). Every method has a sensible default, so you only implement the
   operations your filesystem actually supports.
@@ -20,62 +20,68 @@ none of it.
   `fuse_reply_*`/`fuse_add_direntry` symbols, mode_t width, ...) are handled internally.
 - Filenames are `&str`/`String` - **UTF-8 only, by design**. An incoming name that isn't
   valid UTF-8 is rejected with `EILSEQ` before your filesystem ever sees it.
-- Single-threaded: `Session::run` drives libfuse's `fuse_session_loop`, so `Filesystem`
-  methods are never called concurrently and take `&mut self` with no `Send`/`Sync` bound.
+- Multi-threaded by default. Callbacks take shared references and may overlap on the same
+  filesystem, node, or handle. Mutable state uses `Mutex`, `RwLock`, or atomics at the
+  filesystem's chosen granularity. `ThreadingMode::SingleThreaded` is available when
+  callback overlap must be disabled.
 
 ## Minimal usage
 
 ```rust
 use std::borrow::Cow;
-use std::time::{Duration, SystemTime};
-use fuse3::{
-    DirBuffer, Entry, Errno, FileAttr, FileInfo, FileType, Filesystem, Inode, OpenReply,
-    Request, Session, ROOT_INODE,
-};
+use fuse3::{Caller, Errno, FileKind, NodeAttr, NodeFs, Opened, Session};
 
-const HELLO_INODE: Inode = 2;
 const HELLO_CONTENT: &[u8] = b"Hello World!\n";
 
-struct HelloFs { mounted_at: SystemTime }
+struct HelloFs;
 
-impl Filesystem for HelloFs {
-    fn lookup(&mut self, _req: &Request, parent: Inode, name: &str) -> Result<Entry, Errno> {
-        if parent != ROOT_INODE || name != "hello" {
-            return Err(Errno::ENOENT);
-        }
-        let attr = FileAttr {
-            ino: HELLO_INODE,
-            kind: FileType::RegularFile,
+impl NodeFs for HelloFs {
+    type Node = &'static [u8];
+    type Handle = ();
+    type DirHandle = ();
+
+    fn root(&mut self) -> Self::Node { HELLO_CONTENT }
+
+    fn getattr(&self, _node: &&'static [u8], _caller: &Caller) -> Result<NodeAttr, Errno> {
+        Ok(NodeAttr {
+            kind: FileKind::RegularFile,
             perm: 0o444,
             nlink: 1,
             size: HELLO_CONTENT.len() as u64,
-            atime: self.mounted_at,
-            mtime: self.mounted_at,
-            ctime: self.mounted_at,
             ..Default::default()
-        };
-        Ok(Entry { ino: HELLO_INODE, attr, entry_timeout: Duration::from_secs(1), ..Default::default() })
+        })
     }
 
-    fn open(&mut self, _req: &Request, ino: Inode, _fi: &FileInfo) -> Result<OpenReply, Errno> {
-        if ino == HELLO_INODE { Ok(OpenReply::new(0)) } else { Err(Errno::EISDIR) }
+    fn open(&self, _node: &&'static [u8], _flags: i32, _caller: &Caller) -> Result<Opened<()>, Errno> {
+        Ok(Opened::new(()))
     }
 
-    fn read(&mut self, _req: &Request, _ino: Inode, size: usize, offset: u64, _fi: &FileInfo) -> Result<Cow<'_, [u8]>, Errno> {
+    fn read<'a>(&'a self, node: &'a &'static [u8], _handle: &'a (), offset: u64, size: usize, _caller: &Caller) -> Result<Cow<'a, [u8]>, Errno> {
         let offset = offset as usize;
-        let end = (offset + size).min(HELLO_CONTENT.len());
-        Ok(Cow::Borrowed(&HELLO_CONTENT[offset.min(end)..end]))
+        let end = (offset + size).min(node.len());
+        Ok(Cow::Borrowed(&node[offset.min(end)..end]))
     }
-
-    // ... getattr, readdir
 }
 
 fn main() {
     let mountpoint = std::env::args().nth(1).expect("usage: <mountpoint>");
-    let fs = HelloFs { mounted_at: SystemTime::now() };
-    Session::mount_and_run(fs, &mountpoint, &[]).expect("mount failed");
+    Session::mount_and_run(HelloFs, &mountpoint, &[]).expect("mount failed");
 }
 ```
+
+`SessionConfig` controls dispatch. Its default is a ten-worker pool with no idle
+retirement and `clone_fd` disabled. Libfuse limits `max_threads` to 100,000:
+
+```rust
+use fuse3::{SessionConfig, ThreadingMode};
+let config = SessionConfig { threading: ThreadingMode::SingleThreaded };
+// Session::new_with_config(fs, &options, config)?;
+```
+
+In multi-threaded mode there is no callback ordering or automatic per-node or
+per-handle serialization. For operations locking multiple nodes, acquire application
+locks in ascending `NodeId` order. `release`/`releasedir` are delayed until existing
+leases drain and consume their handle exactly once.
 
 ## Running the `hello_ll` example
 

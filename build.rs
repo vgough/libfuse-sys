@@ -174,6 +174,7 @@ fn main() {
     let mut api_version: Option<u32> = None;
     version!(api_version, "fuse_31", 31);
     version!(api_version, "fuse_35", 35);
+    version!(api_version, "fuse_312", 312);
     // Warn if no API version is selected
     // if api_version.is_none() {
     //     println!(
@@ -186,6 +187,9 @@ fn main() {
 
     let mut pkgcfg = pkg_config::Config::new();
     pkgcfg.cargo_metadata(false);
+    if cfg!(feature = "fuse_312") {
+        pkgcfg.atleast_version("3.12.0");
+    }
 
     // FUSE 3.1 and later use the fuse3 pkg-config module.
     let fuse_lib = pkgcfg.cargo_metadata(true).probe("fuse3").unwrap();

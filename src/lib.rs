@@ -45,6 +45,41 @@ pub mod fuse {
 #[allow(clashing_extern_declarations)]
 pub mod fuse_lowlevel {
     include!(concat!(env!("OUT_DIR"), "/fuse_lowlevel.rs"));
+
+    /// Stable names for the libfuse 3.12 multi-thread loop API. Upstream
+    /// exposes version-suffixed loop symbols on some platforms.
+    #[cfg(feature = "fuse_312")]
+    pub unsafe fn session_loop_mt_312(
+        session: *mut fuse_session,
+        config: *mut fuse_loop_config,
+    ) -> ::std::os::raw::c_int {
+        unsafe { fuse_session_loop_mt_312(session, config) }
+    }
+
+    #[cfg(feature = "fuse_312")]
+    pub unsafe fn loop_cfg_create_312() -> *mut fuse_loop_config {
+        unsafe { fuse_loop_cfg_create() }
+    }
+
+    #[cfg(feature = "fuse_312")]
+    pub unsafe fn loop_cfg_destroy_312(config: *mut fuse_loop_config) {
+        unsafe { fuse_loop_cfg_destroy(config) }
+    }
+
+    #[cfg(feature = "fuse_312")]
+    pub unsafe fn loop_cfg_set_idle_threads_312(config: *mut fuse_loop_config, value: u32) {
+        unsafe { fuse_loop_cfg_set_idle_threads(config, value) }
+    }
+
+    #[cfg(feature = "fuse_312")]
+    pub unsafe fn loop_cfg_set_max_threads_312(config: *mut fuse_loop_config, value: u32) {
+        unsafe { fuse_loop_cfg_set_max_threads(config, value) }
+    }
+
+    #[cfg(feature = "fuse_312")]
+    pub unsafe fn loop_cfg_set_clone_fd_312(config: *mut fuse_loop_config, value: u32) {
+        unsafe { fuse_loop_cfg_set_clone_fd(config, value) }
+    }
 }
 
 #[cfg(feature = "cuse_lowlevel")]

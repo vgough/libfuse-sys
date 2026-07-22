@@ -38,3 +38,4 @@ cuse_lowlevel = []
 # API versions
 fuse_31 = []
 fuse_35 = []
+fuse_312 = []

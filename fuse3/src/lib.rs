@@ -21,10 +21,10 @@ mod session;
 #[cfg(target_os = "macos")]
 mod darwin;
 
-pub use session::{Error, MountOption, Session};
+pub use session::{Error, MountOption, Session, SessionConfig, ThreadPoolConfig, ThreadingMode};
 
 // The user-facing API is the node-based core.
 pub use typed_fuse_core::{
-    Caller, ConnInfo, Cx, DirSink, Errno, FileKind, NodeAttr, NodeFs, NodeId, OpenHints, Opened,
-    SetAttr, StatFs, TimeOrNow, XattrReply,
+    Caller, ConnInfo, ConnectionCapability, Cx, DirSink, Errno, FileKind, NodeAttr, NodeFs, NodeId,
+    NodeRef, OpenHints, Opened, SetAttr, StatFs, TimeOrNow, XattrReply,
 };

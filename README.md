@@ -14,7 +14,7 @@
 Add the dependencies to your Cargo.toml
 ```toml
 [dependencies]
-libfuse-sys = { version = "*", features = ["fuse_35"] }
+libfuse-sys = { version = "*", features = ["fuse_312"] }
 libc = "*"
 ```
 You can select other API versions for fuse. Currently supported are
@@ -46,23 +46,29 @@ Linux.
 
 If you're writing a new filesystem, prefer the [`fuse3`](fuse3/) crate in this workspace
 over the raw bindings above. It's a safe, Rust-friendly low-level FUSE API built on top of
-`libfuse-sys`: implement the `Filesystem` trait with ordinary `&str`/`Result<T, Errno>`
+`libfuse-sys`: implement the concurrent `NodeFs` trait with ordinary `&str`/`Result<T, Errno>`
 methods and hand it to `Session` - no `unsafe`, no C types, no `#[cfg(target_os = ...)]`
 required in your code.
 
 ```rust
-impl Filesystem for HelloFs {
-    fn lookup(&mut self, _req: &Request, parent: Inode, name: &str) -> Result<Entry, Errno> {
-        if parent != ROOT_INODE || name != "hello" {
-            return Err(Errno::ENOENT);
-        }
-        Ok(Entry { ino: 2, attr: self.hello_attr(), ..Default::default() })
+impl NodeFs for HelloFs {
+    type Node = Node;
+    type Handle = ();
+    type DirHandle = ();
+
+    fn root(&mut self) -> Node { Node::root() }
+    fn getattr(&self, node: &Node, caller: &Caller) -> Result<NodeAttr, Errno> {
+        node.getattr(caller)
     }
-    // ... getattr, open, read, readdir
+    // ... lookup, open, read, readdir
 }
 
 Session::mount_and_run(HelloFs::new(), &mountpoint, &[])?;
 ```
+
+Sessions dispatch concurrently by default. Node and handle payloads are `Send + Sync`,
+and implementations use interior synchronization for mutable state. A single-threaded
+runtime mode is available through `SessionConfig`.
 
 See `fuse3/README.md` for details and `fuse3/examples/hello_ll.rs` for the full example.
 

@@ -1,26 +1,19 @@
-//! The node-tracking runtime: the base layer that owns inode identity,
-//! lifetime (lookup/link/open refcounts and deferred deletion), and the
-//! file-handle table, so filesystems don't have to.
-//!
-//! [`Runtime`] is generic, pure Rust, and C-free, so it is unit-testable
-//! without mounting anything (see the tests at the bottom of this file).
-//! `fuse3`'s trampolines decode raw C arguments, call a `Runtime` method,
-//! and encode the returned core types back into `fuse_reply_*`.
+//! Concurrent node and handle lifetime management for [`NodeFs`].
 
 use std::borrow::Cow;
+use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::attr::{NodeAttr, SetAttr, StatFs};
 use crate::errno::Errno;
-use crate::node_fs::{Caller, ConnInfo, DirSink, NodeFs, NodeId, OpenHints, XattrReply};
+use crate::node_fs::{
+    Caller, ConnInfo, ConnectionCapability, DirSink, NodeFs, NodeId, OpenHints, XattrReply,
+};
 
-// ---------------------------------------------------------------------
-// Reply values handed back to the FFI layer
-// ---------------------------------------------------------------------
-
-/// An entry reply (`lookup`/`mknod`/`mkdir`/...): inode, generation, and
-/// attributes, ready for `conv::entry_to_entry_param`.
 #[derive(Clone, Copy, Debug)]
 pub struct EntryReply {
     pub ino: u64,
@@ -28,301 +21,371 @@ pub struct EntryReply {
     pub attr: NodeAttr,
 }
 
-/// The result of a `lookup`: a positive entry, or a negative-cache hit.
 #[derive(Clone, Copy, Debug)]
 pub enum LookupReply {
     Found(EntryReply),
     Negative,
 }
 
-/// The result of an `open`/`opendir`/`create`: the runtime-assigned file
-/// handle plus the caching hints the filesystem requested.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenReply {
     pub fh: u64,
     pub hints: OpenHints,
 }
 
-// ---------------------------------------------------------------------
-// Node table
-// ---------------------------------------------------------------------
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct NodeRecord<N> {
+    payload: N,
+}
 
 struct Slot<N> {
-    payload: N,
+    record: Arc<NodeRecord<N>>,
     generation: u64,
-    /// Number of directory references (hard links). Together with
-    /// `lookups`/`opens`, this drives deferred deletion. This is independent
-    /// of the user-visible `NodeAttr::nlink`, which the filesystem supplies.
     links: u32,
-    /// Kernel lookup count (incremented per entry reply, decremented by
-    /// `forget`).
     lookups: u64,
-    /// Number of currently-open handles referencing this node.
     opens: u32,
-    /// Recorded parent, used to emit `..` in `readdir`.
+    leases: u32,
     parent: NodeId,
 }
 
 impl<N> Slot<N> {
-    fn is_droppable(&self) -> bool {
-        self.links == 0 && self.lookups == 0 && self.opens == 0
+    fn droppable(&self) -> bool {
+        self.links == 0 && self.lookups == 0 && self.opens == 0 && self.leases == 0
     }
 }
 
-/// The inode table. Owns node payloads and assigns inode numbers +
-/// generations, reclaiming (with a bumped generation) inodes whose nodes are
-/// fully dropped.
+/// Inode allocation and lifetime metadata. It is synchronized internally by
+/// [`Runtime`]; the type is public only for compatibility with earlier
+/// versions and is not normally used directly.
 pub struct NodeTable<N> {
     map: BTreeMap<u64, Slot<N>>,
     next_ino: u64,
-    /// Reclaimed `(ino, next_generation)` pairs available for reuse.
     free: Vec<(u64, u64)>,
 }
 
 impl<N> NodeTable<N> {
     fn new() -> Self {
-        NodeTable {
+        Self {
             map: BTreeMap::new(),
-            next_ino: 2, // 1 is the root
+            next_ino: 2,
             free: Vec::new(),
         }
     }
 
     fn alloc(&mut self) -> (u64, u64) {
-        if let Some((ino, gen)) = self.free.pop() {
-            (ino, gen)
-        } else {
+        self.free.pop().unwrap_or_else(|| {
             let ino = self.next_ino;
             self.next_ino += 1;
             (ino, 0)
-        }
+        })
     }
 
-    /// Drops the node's payload and reclaims its inode iff nothing references
-    /// it any more. The root (inode 1) keeps a permanent link and is never
-    /// dropped.
     fn maybe_drop(&mut self, id: NodeId) {
         let ino = id.ino();
-        let droppable = self.map.get(&ino).map(Slot::is_droppable).unwrap_or(false);
-        if droppable {
-            let gen = self.map.remove(&ino).unwrap().generation;
-            self.free.push((ino, gen.wrapping_add(1)));
+        if self.map.get(&ino).is_some_and(Slot::droppable) {
+            let generation = self.map.remove(&ino).unwrap().generation;
+            self.free.push((ino, generation.wrapping_add(1)));
         }
     }
 }
 
-// ---------------------------------------------------------------------
-// Cx: what structural ops use to resolve/insert/link nodes
-// ---------------------------------------------------------------------
+struct Shared<N> {
+    table: Mutex<NodeTable<N>>,
+}
 
-/// A view over the node table handed to structural [`NodeFs`] operations
-/// (`lookup`, `mkdir`, `rename`, ...). Resolving a node here replaces the
-/// per-filesystem inode map, and inserting/linking here drives the runtime's
-/// identity allocation and lifetime tracking.
+/// A shared node lease. Keeping this value alive prevents the inode from
+/// being reclaimed or reused. It dereferences to the filesystem's node.
+pub struct NodeRef<N> {
+    id: NodeId,
+    record: Arc<NodeRecord<N>>,
+    shared: Arc<Shared<N>>,
+}
+
+impl<N> Deref for NodeRef<N> {
+    type Target = N;
+    fn deref(&self) -> &N {
+        &self.record.payload
+    }
+}
+
+impl<N> Drop for NodeRef<N> {
+    fn drop(&mut self) {
+        let mut table = lock(&self.shared.table);
+        if let Some(slot) = table.map.get_mut(&self.id.ino()) {
+            if Arc::ptr_eq(&slot.record, &self.record) {
+                slot.leases = slot.leases.saturating_sub(1);
+            }
+        }
+        table.maybe_drop(self.id);
+    }
+}
+
+/// Concurrent access to the runtime's node table for structural callbacks.
+/// All mutation methods take `&self` and hold the metadata lock only for the
+/// bookkeeping operation itself.
 pub struct Cx<'a, N> {
-    table: &'a mut NodeTable<N>,
+    shared: &'a Arc<Shared<N>>,
 }
 
 impl<'a, N> Cx<'a, N> {
-    /// Borrows the payload of `id`, if it exists.
-    pub fn get(&self, id: NodeId) -> Option<&N> {
-        self.table.map.get(&id.ino()).map(|s| &s.payload)
+    pub fn get(&self, id: NodeId) -> Option<NodeRef<N>> {
+        let mut table = lock(&self.shared.table);
+        let slot = table.map.get_mut(&id.ino())?;
+        slot.leases = slot
+            .leases
+            .checked_add(1)
+            .expect("node lease count overflow");
+        Some(NodeRef {
+            id,
+            record: Arc::clone(&slot.record),
+            shared: Arc::clone(self.shared),
+        })
     }
 
-    /// Mutably borrows the payload of `id`, if it exists.
-    pub fn get_mut(&mut self, id: NodeId) -> Option<&mut N> {
-        self.table.map.get_mut(&id.ino()).map(|s| &mut s.payload)
-    }
-
-    /// Mutably borrows two distinct nodes at once (e.g. for `rename`).
-    /// Returns `None` if `a == b` or either is missing.
-    pub fn get_disjoint_mut(&mut self, a: NodeId, b: NodeId) -> Option<(&mut N, &mut N)> {
-        if a == b {
-            return None;
-        }
-        let pa = self.table.map.get_mut(&a.ino())? as *mut Slot<N>;
-        let pb = self.table.map.get_mut(&b.ino())? as *mut Slot<N>;
-        // SAFETY: `a != b`, so these are distinct entries of the map; a
-        // `BTreeMap` never hands out aliasing references for distinct keys,
-        // and the two raw pointers were taken from separate lookups with no
-        // live borrow in between.
-        unsafe { Some((&mut (*pa).payload, &mut (*pb).payload)) }
-    }
-
-    /// Whether `id` is currently live.
     pub fn contains(&self, id: NodeId) -> bool {
-        self.table.map.contains_key(&id.ino())
+        lock(&self.shared.table).map.contains_key(&id.ino())
     }
 
-    /// Inserts a brand-new node with `parent` as its recorded parent,
-    /// returning its freshly assigned [`NodeId`]. The node starts with one
-    /// directory link (the entry the caller is about to record in `parent`).
-    pub fn insert(&mut self, payload: N, parent: NodeId) -> NodeId {
-        let (ino, generation) = self.table.alloc();
-        self.table.map.insert(
+    pub fn insert(&self, payload: N, parent: NodeId) -> NodeId {
+        let mut table = lock(&self.shared.table);
+        let (ino, generation) = table.alloc();
+        table.map.insert(
             ino,
             Slot {
-                payload,
+                record: Arc::new(NodeRecord { payload }),
                 generation,
                 links: 1,
                 lookups: 0,
                 opens: 0,
+                leases: 0,
                 parent,
             },
         );
         NodeId::from_ino(ino)
     }
 
-    /// Updates the recorded parent of `id` (used to emit `..` in `readdir`),
-    /// e.g. after a directory is moved by `rename`.
-    pub fn reparent(&mut self, id: NodeId, new_parent: NodeId) {
-        if let Some(s) = self.table.map.get_mut(&id.ino()) {
-            s.parent = new_parent;
+    pub fn reparent(&self, id: NodeId, new_parent: NodeId) {
+        if let Some(slot) = lock(&self.shared.table).map.get_mut(&id.ino()) {
+            slot.parent = new_parent;
         }
     }
 
-    /// Records an additional directory reference to `id` (a hard link).
-    pub fn add_link(&mut self, id: NodeId) {
-        if let Some(s) = self.table.map.get_mut(&id.ino()) {
-            s.links += 1;
+    pub fn add_link(&self, id: NodeId) {
+        if let Some(slot) = lock(&self.shared.table).map.get_mut(&id.ino()) {
+            slot.links = slot.links.checked_add(1).expect("node link count overflow");
         }
     }
 
-    /// Drops a directory reference to `id`, freeing the node if it is now
-    /// fully unreferenced (no links, no kernel lookups, no open handles).
-    pub fn remove_link(&mut self, id: NodeId) {
-        if let Some(s) = self.table.map.get_mut(&id.ino()) {
-            s.links = s.links.saturating_sub(1);
+    pub fn remove_link(&self, id: NodeId) {
+        let mut table = lock(&self.shared.table);
+        if let Some(slot) = table.map.get_mut(&id.ino()) {
+            slot.links = slot.links.saturating_sub(1);
         }
-        self.table.maybe_drop(id);
+        table.maybe_drop(id);
     }
 }
 
-// ---------------------------------------------------------------------
-// Handle table
-// ---------------------------------------------------------------------
+struct HandleState {
+    active: u32,
+    closing: bool,
+    taken: bool,
+}
+
+struct HandleRecord<H> {
+    payload: UnsafeCell<ManuallyDrop<H>>,
+    state: Mutex<HandleState>,
+    drained: Condvar,
+}
+
+// The payload is only moved after closing prevents new leases and all prior
+// leases have drained. Shared access is valid because `H: Sync`.
+unsafe impl<H: Send + Sync> Send for HandleRecord<H> {}
+unsafe impl<H: Send + Sync> Sync for HandleRecord<H> {}
+
+impl<H> HandleRecord<H> {
+    fn new(payload: H) -> Self {
+        Self {
+            payload: UnsafeCell::new(ManuallyDrop::new(payload)),
+            state: Mutex::new(HandleState {
+                active: 0,
+                closing: false,
+                taken: false,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Option<HandleLease<H>> {
+        let mut state = lock(&self.state);
+        if state.closing {
+            return None;
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("handle lease count overflow");
+        drop(state);
+        Some(HandleLease {
+            record: Arc::clone(self),
+        })
+    }
+
+    fn close_and_take(&self) -> H {
+        let mut state = lock(&self.state);
+        state.closing = true;
+        while state.active != 0 {
+            state = self.drained.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        state.taken = true;
+        drop(state);
+        // SAFETY: the record is closed, no leases exist, and this method is
+        // called only by the thread that removed the record from the table.
+        unsafe { ManuallyDrop::take(&mut *self.payload.get()) }
+    }
+}
+
+impl<H> Drop for HandleRecord<H> {
+    fn drop(&mut self) {
+        if !lock(&self.state).taken {
+            // SAFETY: `drop` has exclusive access to the record, so no lease
+            // can still refer to the payload.
+            unsafe { ManuallyDrop::drop(&mut *self.payload.get()) };
+        }
+    }
+}
+
+struct HandleLease<H> {
+    record: Arc<HandleRecord<H>>,
+}
+
+impl<H> Deref for HandleLease<H> {
+    type Target = H;
+    fn deref(&self) -> &H {
+        // SAFETY: acquiring the lease increments `active`; close waits for it.
+        unsafe { &*self.record.payload.get() }
+    }
+}
+
+impl<H> Drop for HandleLease<H> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.record.state);
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 && state.closing {
+            self.record.drained.notify_all();
+        }
+    }
+}
 
 struct HandleTable<F: NodeFs> {
-    files: BTreeMap<u64, F::Handle>,
-    dirs: BTreeMap<u64, F::DirHandle>,
+    files: BTreeMap<u64, Arc<HandleRecord<F::Handle>>>,
+    dirs: BTreeMap<u64, Arc<HandleRecord<F::DirHandle>>>,
     next_fh: u64,
 }
 
 impl<F: NodeFs> HandleTable<F> {
     fn new() -> Self {
-        HandleTable {
+        Self {
             files: BTreeMap::new(),
             dirs: BTreeMap::new(),
             next_fh: 1,
         }
     }
-
-    fn alloc_file(&mut self, payload: F::Handle) -> u64 {
+    fn next(&mut self) -> u64 {
         let fh = self.next_fh;
         self.next_fh += 1;
-        self.files.insert(fh, payload);
         fh
     }
-
-    fn alloc_dir(&mut self, payload: F::DirHandle) -> u64 {
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        self.dirs.insert(fh, payload);
+    fn add_file(&mut self, handle: F::Handle) -> u64 {
+        let fh = self.next();
+        self.files.insert(fh, Arc::new(HandleRecord::new(handle)));
         fh
     }
-
-    fn file_mut(&mut self, fh: u64) -> Option<&mut F::Handle> {
-        self.files.get_mut(&fh)
-    }
-
-    fn dir_mut(&mut self, fh: u64) -> Option<&mut F::DirHandle> {
-        self.dirs.get_mut(&fh)
-    }
-
-    fn remove_file(&mut self, fh: u64) -> Option<F::Handle> {
-        self.files.remove(&fh)
-    }
-
-    fn remove_dir(&mut self, fh: u64) -> Option<F::DirHandle> {
-        self.dirs.remove(&fh)
+    fn add_dir(&mut self, handle: F::DirHandle) -> u64 {
+        let fh = self.next();
+        self.dirs.insert(fh, Arc::new(HandleRecord::new(handle)));
+        fh
     }
 }
 
-// ---------------------------------------------------------------------
-// Runtime
-// ---------------------------------------------------------------------
-
-/// The node-tracking runtime wrapping a filesystem `F`. Owns the inode and
-/// handle tables and mediates every operation.
 pub struct Runtime<F: NodeFs> {
     fs: F,
-    table: NodeTable<F::Node>,
-    handles: HandleTable<F>,
+    shared: Arc<Shared<F::Node>>,
+    handles: Mutex<HandleTable<F>>,
     ttl: Duration,
     negative_ttl: Duration,
+    parallel_dirops: bool,
 }
 
 impl<F: NodeFs> Runtime<F> {
-    /// Builds a runtime around `fs`, seeding the root node from
-    /// [`NodeFs::root`].
     pub fn new(mut fs: F) -> Self {
         let root = fs.root();
         let mut table = NodeTable::new();
         table.map.insert(
-            NodeId::ROOT.ino(),
+            1,
             Slot {
-                payload: root,
+                record: Arc::new(NodeRecord { payload: root }),
                 generation: 0,
                 links: 1,
                 lookups: 0,
                 opens: 0,
+                leases: 0,
                 parent: NodeId::ROOT,
             },
         );
-        // Let the filesystem seed any statically-known children now that the
-        // root exists.
+        let shared = Arc::new(Shared {
+            table: Mutex::new(table),
+        });
         {
-            let mut cx = Cx { table: &mut table };
-            fs.populate(&mut cx);
+            let cx = Cx { shared: &shared };
+            fs.populate(&cx);
         }
-        Runtime {
+        Self {
             fs,
-            table,
-            handles: HandleTable::new(),
+            shared,
+            handles: Mutex::new(HandleTable::new()),
             ttl: Duration::from_secs(1),
             negative_ttl: Duration::from_secs(1),
+            parallel_dirops: false,
         }
     }
 
-    /// The entry/attribute cache TTL sent to the kernel.
     pub fn ttl(&self) -> Duration {
         self.ttl
     }
-
-    /// The negative-lookup cache TTL.
     pub fn negative_ttl(&self) -> Duration {
         self.negative_ttl
     }
-
-    /// Sets the entry/attribute cache TTL.
     pub fn set_ttl(&mut self, ttl: Duration) {
         self.ttl = ttl;
     }
-
-    /// Sets the negative-lookup cache TTL.
     pub fn set_negative_ttl(&mut self, ttl: Duration) {
         self.negative_ttl = ttl;
     }
+    #[doc(hidden)]
+    pub fn set_parallel_dirops(&mut self, enabled: bool) {
+        self.parallel_dirops = enabled;
+    }
+    fn cx(&self) -> Cx<'_, F::Node> {
+        Cx {
+            shared: &self.shared,
+        }
+    }
+    fn node(&self, ino: u64) -> Result<NodeRef<F::Node>, Errno> {
+        self.cx().get(NodeId::from_ino(ino)).ok_or(Errno::ENOENT)
+    }
 
-    /// Builds an [`EntryReply`] for `id` and bumps the kernel lookup count
-    /// (every entry reply hands the kernel a new reference that a later
-    /// `forget` will release).
-    fn entry_for(&mut self, id: NodeId, caller: &Caller) -> Result<EntryReply, Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get(&id.ino()).ok_or(Errno::ENOENT)?;
-        let attr = fs.getattr(&slot.payload, caller)?;
+    fn entry_for(&self, id: NodeId, caller: &Caller) -> Result<EntryReply, Errno> {
+        let node = self.cx().get(id).ok_or(Errno::ENOENT)?;
+        let attr = self.fs.getattr(&node, caller)?;
+        let mut table = lock(&self.shared.table);
+        let slot = table.map.get_mut(&id.ino()).ok_or(Errno::ENOENT)?;
         let generation = slot.generation;
-        table.map.get_mut(&id.ino()).unwrap().lookups += 1;
+        slot.lookups = slot.lookups.checked_add(1).expect("lookup count overflow");
         Ok(EntryReply {
             ino: id.ino(),
             generation,
@@ -330,190 +393,154 @@ impl<F: NodeFs> Runtime<F> {
         })
     }
 
-    // --- lifecycle / no-node ops ---
-
-    pub fn init(&mut self, conn: &mut ConnInfo) {
+    pub fn init(&self, conn: &mut ConnInfo) {
+        if self.parallel_dirops {
+            conn.set_enabled(ConnectionCapability::ParallelDirectoryOperations, true);
+        }
         self.fs.init(conn);
     }
-
-    pub fn destroy(&mut self) {
+    pub fn destroy(&self) {
         self.fs.destroy();
     }
-
-    pub fn forget(&mut self, ino: u64, nlookup: u64) {
-        if let Some(s) = self.table.map.get_mut(&ino) {
+    pub fn forget(&self, ino: u64, nlookup: u64) {
+        let mut t = lock(&self.shared.table);
+        if let Some(s) = t.map.get_mut(&ino) {
             s.lookups = s.lookups.saturating_sub(nlookup);
         }
-        self.table.maybe_drop(NodeId::from_ino(ino));
+        t.maybe_drop(NodeId::from_ino(ino));
     }
-
-    pub fn statfs(&mut self, _ino: u64, caller: &Caller) -> Result<StatFs, Errno> {
+    pub fn statfs(&self, _ino: u64, caller: &Caller) -> Result<StatFs, Errno> {
         self.fs.statfs(caller)
     }
-
-    // --- single existing node ---
-
-    pub fn getattr(&mut self, ino: u64, caller: &Caller) -> Result<NodeAttr, Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get(&ino).ok_or(Errno::ENOENT)?;
-        fs.getattr(&slot.payload, caller)
+    pub fn getattr(&self, ino: u64, caller: &Caller) -> Result<NodeAttr, Errno> {
+        let n = self.node(ino)?;
+        self.fs.getattr(&n, caller)
     }
-
-    pub fn setattr(
-        &mut self,
-        ino: u64,
-        set: &SetAttr,
-        caller: &Caller,
-    ) -> Result<NodeAttr, Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
-        fs.setattr(&mut slot.payload, set, caller)
+    pub fn setattr(&self, ino: u64, set: &SetAttr, caller: &Caller) -> Result<NodeAttr, Errno> {
+        let n = self.node(ino)?;
+        self.fs.setattr(&n, set, caller)
     }
-
-    pub fn readlink(&mut self, ino: u64, caller: &Caller) -> Result<String, Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get(&ino).ok_or(Errno::ENOENT)?;
-        fs.readlink(&slot.payload, caller)
+    pub fn readlink(&self, ino: u64, caller: &Caller) -> Result<String, Errno> {
+        let n = self.node(ino)?;
+        self.fs.readlink(&n, caller)
     }
-
-    pub fn access(&mut self, ino: u64, mask: i32, caller: &Caller) -> Result<(), Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get(&ino).ok_or(Errno::ENOENT)?;
-        fs.access(&slot.payload, mask, caller)
+    pub fn access(&self, ino: u64, mask: i32, caller: &Caller) -> Result<(), Errno> {
+        let n = self.node(ino)?;
+        self.fs.access(&n, mask, caller)
     }
-
     pub fn setxattr(
-        &mut self,
+        &self,
         ino: u64,
         name: &str,
         value: &[u8],
         flags: i32,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
-        fs.setxattr(&mut slot.payload, name, value, flags, caller)
+        let n = self.node(ino)?;
+        self.fs.setxattr(&n, name, value, flags, caller)
     }
-
     pub fn getxattr(
-        &mut self,
+        &self,
         ino: u64,
         name: &str,
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get(&ino).ok_or(Errno::ENOENT)?;
-        fs.getxattr(&slot.payload, name, size, caller)
+        let n = self.node(ino)?;
+        self.fs.getxattr(&n, name, size, caller)
+    }
+    pub fn listxattr(&self, ino: u64, size: usize, caller: &Caller) -> Result<XattrReply, Errno> {
+        let n = self.node(ino)?;
+        self.fs.listxattr(&n, size, caller)
+    }
+    pub fn removexattr(&self, ino: u64, name: &str, caller: &Caller) -> Result<(), Errno> {
+        let n = self.node(ino)?;
+        self.fs.removexattr(&n, name, caller)
     }
 
-    pub fn listxattr(
-        &mut self,
-        ino: u64,
-        size: usize,
-        caller: &Caller,
-    ) -> Result<XattrReply, Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get(&ino).ok_or(Errno::ENOENT)?;
-        fs.listxattr(&slot.payload, size, caller)
+    fn add_open(&self, ino: u64) -> Result<(), Errno> {
+        let mut t = lock(&self.shared.table);
+        let s = t.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
+        s.opens = s.opens.checked_add(1).expect("open count overflow");
+        Ok(())
+    }
+    fn remove_open(&self, ino: u64) {
+        let mut t = lock(&self.shared.table);
+        if let Some(s) = t.map.get_mut(&ino) {
+            s.opens = s.opens.saturating_sub(1);
+        }
+        t.maybe_drop(NodeId::from_ino(ino));
+    }
+    fn file(&self, fh: u64) -> Result<HandleLease<F::Handle>, Errno> {
+        let record = lock(&self.handles)
+            .files
+            .get(&fh)
+            .cloned()
+            .ok_or(Errno::EBADF)?;
+        record.acquire().ok_or(Errno::EBADF)
+    }
+    fn dir(&self, fh: u64) -> Option<HandleLease<F::DirHandle>> {
+        let record = lock(&self.handles).dirs.get(&fh).cloned()?;
+        record.acquire()
     }
 
-    pub fn removexattr(&mut self, ino: u64, name: &str, caller: &Caller) -> Result<(), Errno> {
-        let Runtime { fs, table, .. } = self;
-        let slot = table.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
-        fs.removexattr(&mut slot.payload, name, caller)
-    }
-
-    // --- open files ---
-
-    pub fn open(&mut self, ino: u64, flags: i32, caller: &Caller) -> Result<OpenReply, Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let slot = table.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
-        let opened = fs.open(&mut slot.payload, flags, caller)?;
-        let fh = handles.alloc_file(opened.handle);
-        slot.opens += 1;
+    pub fn open(&self, ino: u64, flags: i32, caller: &Caller) -> Result<OpenReply, Errno> {
+        let node = self.node(ino)?;
+        let opened = self.fs.open(&node, flags, caller)?;
+        self.add_open(ino)?;
+        let fh = lock(&self.handles).add_file(opened.handle);
         Ok(OpenReply {
             fh,
             hints: opened.hints,
         })
     }
 
-    pub fn read(
-        &mut self,
+    /// Runs the reply continuation before releasing node and handle leases,
+    /// allowing a borrowed `Cow` to be sent without copying.
+    pub fn read<R>(
+        &self,
         ino: u64,
         fh: u64,
         offset: u64,
         size: usize,
         caller: &Caller,
-    ) -> Result<Cow<'_, [u8]>, Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let node = table
-            .map
-            .get_mut(&ino)
-            .map(|s| &mut s.payload)
-            .ok_or(Errno::ENOENT)?;
-        let handle = handles.file_mut(fh).ok_or(Errno::EBADF)?;
-        fs.read(node, handle, offset, size, caller)
+        reply: impl FnOnce(Result<Cow<'_, [u8]>, Errno>) -> R,
+    ) -> R {
+        let node = match self.node(ino) {
+            Ok(v) => v,
+            Err(e) => return reply(Err(e)),
+        };
+        let handle = match self.file(fh) {
+            Ok(v) => v,
+            Err(e) => return reply(Err(e)),
+        };
+        reply(self.fs.read(&node, &handle, offset, size, caller))
     }
 
     pub fn write(
-        &mut self,
+        &self,
         ino: u64,
         fh: u64,
         data: &[u8],
         offset: u64,
         caller: &Caller,
     ) -> Result<usize, Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let node = table
-            .map
-            .get_mut(&ino)
-            .map(|s| &mut s.payload)
-            .ok_or(Errno::ENOENT)?;
-        let handle = handles.file_mut(fh).ok_or(Errno::EBADF)?;
-        fs.write(node, handle, data, offset, caller)
+        let n = self.node(ino)?;
+        let h = self.file(fh)?;
+        self.fs.write(&n, &h, data, offset, caller)
     }
-
-    pub fn flush(&mut self, ino: u64, fh: u64, caller: &Caller) -> Result<(), Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let node = table
-            .map
-            .get_mut(&ino)
-            .map(|s| &mut s.payload)
-            .ok_or(Errno::ENOENT)?;
-        let handle = handles.file_mut(fh).ok_or(Errno::EBADF)?;
-        fs.flush(node, handle, caller)
+    pub fn flush(&self, ino: u64, fh: u64, caller: &Caller) -> Result<(), Errno> {
+        let n = self.node(ino)?;
+        let h = self.file(fh)?;
+        self.fs.flush(&n, &h, caller)
     }
-
-    pub fn fsync(
-        &mut self,
-        ino: u64,
-        fh: u64,
-        datasync: bool,
-        caller: &Caller,
-    ) -> Result<(), Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let node = table
-            .map
-            .get_mut(&ino)
-            .map(|s| &mut s.payload)
-            .ok_or(Errno::ENOENT)?;
-        let handle = handles.file_mut(fh).ok_or(Errno::EBADF)?;
-        fs.fsync(node, handle, datasync, caller)
+    pub fn fsync(&self, ino: u64, fh: u64, datasync: bool, caller: &Caller) -> Result<(), Errno> {
+        let n = self.node(ino)?;
+        let h = self.file(fh)?;
+        self.fs.fsync(&n, &h, datasync, caller)
     }
-
     pub fn fallocate(
-        &mut self,
+        &self,
         ino: u64,
         fh: u64,
         mode: i32,
@@ -521,60 +548,36 @@ impl<F: NodeFs> Runtime<F> {
         length: u64,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let node = table
-            .map
-            .get_mut(&ino)
-            .map(|s| &mut s.payload)
-            .ok_or(Errno::ENOENT)?;
-        let handle = handles.file_mut(fh).ok_or(Errno::EBADF)?;
-        fs.fallocate(node, handle, mode, offset, length, caller)
+        let n = self.node(ino)?;
+        let h = self.file(fh)?;
+        self.fs.fallocate(&n, &h, mode, offset, length, caller)
     }
-
     pub fn lseek(
-        &mut self,
+        &self,
         ino: u64,
         fh: u64,
         offset: u64,
         whence: i32,
         caller: &Caller,
     ) -> Result<u64, Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let node = table
-            .map
-            .get_mut(&ino)
-            .map(|s| &mut s.payload)
-            .ok_or(Errno::ENOENT)?;
-        let handle = handles.file_mut(fh).ok_or(Errno::EBADF)?;
-        fs.lseek(node, handle, offset, whence, caller)
+        let n = self.node(ino)?;
+        let h = self.file(fh)?;
+        self.fs.lseek(&n, &h, offset, whence, caller)
     }
 
-    pub fn release(&mut self, ino: u64, fh: u64, caller: &Caller) -> Result<(), Errno> {
-        let handle = self.handles.remove_file(fh).ok_or(Errno::EBADF)?;
-        let res = {
-            let Runtime { fs, table, .. } = self;
-            let slot = table.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
-            slot.opens = slot.opens.saturating_sub(1);
-            fs.release(&mut slot.payload, handle, caller)
-        };
-        self.table.maybe_drop(NodeId::from_ino(ino));
-        res
+    pub fn release(&self, ino: u64, fh: u64, caller: &Caller) -> Result<(), Errno> {
+        let record = lock(&self.handles).files.remove(&fh).ok_or(Errno::EBADF)?;
+        let node = self.node(ino)?;
+        self.remove_open(ino);
+        let handle = record.close_and_take();
+        self.fs.release(&node, handle, caller)
     }
 
-    // --- open dirs ---
-
-    pub fn opendir(&mut self, ino: u64, flags: i32, caller: &Caller) -> Result<OpenReply, Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let slot = table.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
-        let opened = fs.opendir(&mut slot.payload, flags, caller)?;
-        let fh = handles.alloc_dir(opened.handle);
-        slot.opens += 1;
+    pub fn opendir(&self, ino: u64, flags: i32, caller: &Caller) -> Result<OpenReply, Errno> {
+        let node = self.node(ino)?;
+        let opened = self.fs.opendir(&node, flags, caller)?;
+        self.add_open(ino)?;
+        let fh = lock(&self.handles).add_dir(opened.handle);
         Ok(OpenReply {
             fh,
             hints: opened.hints,
@@ -582,92 +585,78 @@ impl<F: NodeFs> Runtime<F> {
     }
 
     pub fn readdir(
-        &mut self,
+        &self,
         ino: u64,
         fh: u64,
         offset: u64,
         sink: &mut dyn DirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let slot = table.map.get(&ino).ok_or(Errno::ENOENT)?;
-        let parent = slot.parent;
-        // Directories are normally opened first, but be lenient if no handle
-        // is present.
-        let mut tmp = <F::DirHandle as Default>::default();
-        let handle = match handles.dir_mut(fh) {
-            Some(h) => h,
-            None => &mut tmp,
-        };
-        fs.readdir(
-            &slot.payload,
-            NodeId::from_ino(ino),
-            parent,
-            handle,
-            offset,
-            sink,
-            caller,
-        )
+        let node = self.node(ino)?;
+        let parent = lock(&self.shared.table)
+            .map
+            .get(&ino)
+            .map(|s| s.parent)
+            .ok_or(Errno::ENOENT)?;
+        if let Some(h) = self.dir(fh) {
+            self.fs.readdir(
+                &node,
+                NodeId::from_ino(ino),
+                parent,
+                &h,
+                offset,
+                sink,
+                caller,
+            )
+        } else {
+            let h = F::DirHandle::default();
+            self.fs.readdir(
+                &node,
+                NodeId::from_ino(ino),
+                parent,
+                &h,
+                offset,
+                sink,
+                caller,
+            )
+        }
     }
 
     pub fn fsyncdir(
-        &mut self,
+        &self,
         ino: u64,
         fh: u64,
         datasync: bool,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        let Runtime {
-            fs, table, handles, ..
-        } = self;
-        let node = table
-            .map
-            .get_mut(&ino)
-            .map(|s| &mut s.payload)
-            .ok_or(Errno::ENOENT)?;
-        let mut tmp = <F::DirHandle as Default>::default();
-        let handle = match handles.dir_mut(fh) {
-            Some(h) => h,
-            None => &mut tmp,
-        };
-        fs.fsyncdir(node, handle, datasync, caller)
+        let node = self.node(ino)?;
+        if let Some(h) = self.dir(fh) {
+            self.fs.fsyncdir(&node, &h, datasync, caller)
+        } else {
+            self.fs
+                .fsyncdir(&node, &F::DirHandle::default(), datasync, caller)
+        }
     }
 
-    pub fn releasedir(&mut self, ino: u64, fh: u64, caller: &Caller) -> Result<(), Errno> {
-        let handle = self.handles.remove_dir(fh).unwrap_or_default();
-        let res = {
-            let Runtime { fs, table, .. } = self;
-            let slot = table.map.get_mut(&ino).ok_or(Errno::ENOENT)?;
-            slot.opens = slot.opens.saturating_sub(1);
-            fs.releasedir(&mut slot.payload, handle, caller)
-        };
-        self.table.maybe_drop(NodeId::from_ino(ino));
-        res
+    pub fn releasedir(&self, ino: u64, fh: u64, caller: &Caller) -> Result<(), Errno> {
+        let record = lock(&self.handles).dirs.remove(&fh);
+        let node = self.node(ino)?;
+        self.remove_open(ino);
+        let handle = record.map(|r| r.close_and_take()).unwrap_or_default();
+        self.fs.releasedir(&node, handle, caller)
     }
 
-    // --- structural / naming ---
-
-    pub fn lookup(
-        &mut self,
-        parent: u64,
-        name: &str,
-        caller: &Caller,
-    ) -> Result<LookupReply, Errno> {
-        let found = {
-            let Runtime { fs, table, .. } = self;
-            let mut cx = Cx { table };
-            fs.lookup(&mut cx, NodeId::from_ino(parent), name, caller)?
-        };
-        match found {
+    pub fn lookup(&self, parent: u64, name: &str, caller: &Caller) -> Result<LookupReply, Errno> {
+        match self
+            .fs
+            .lookup(&self.cx(), NodeId::from_ino(parent), name, caller)?
+        {
             Some(id) => Ok(LookupReply::Found(self.entry_for(id, caller)?)),
             None => Ok(LookupReply::Negative),
         }
     }
-
     pub fn mknod(
-        &mut self,
+        &self,
         parent: u64,
         name: &str,
         mode: u32,
@@ -675,81 +664,74 @@ impl<F: NodeFs> Runtime<F> {
         umask: u32,
         caller: &Caller,
     ) -> Result<EntryReply, Errno> {
-        let id = {
-            let Runtime { fs, table, .. } = self;
-            let mut cx = Cx { table };
-            fs.mknod(&mut cx, NodeId::from_ino(parent), name, mode, rdev, umask, caller)?
-        };
+        let id = self.fs.mknod(
+            &self.cx(),
+            NodeId::from_ino(parent),
+            name,
+            mode,
+            rdev,
+            umask,
+            caller,
+        )?;
         self.entry_for(id, caller)
     }
-
     pub fn mkdir(
-        &mut self,
+        &self,
         parent: u64,
         name: &str,
         mode: u32,
         umask: u32,
         caller: &Caller,
     ) -> Result<EntryReply, Errno> {
-        let id = {
-            let Runtime { fs, table, .. } = self;
-            let mut cx = Cx { table };
-            fs.mkdir(&mut cx, NodeId::from_ino(parent), name, mode, umask, caller)?
-        };
+        let id = self.fs.mkdir(
+            &self.cx(),
+            NodeId::from_ino(parent),
+            name,
+            mode,
+            umask,
+            caller,
+        )?;
         self.entry_for(id, caller)
     }
-
     pub fn symlink(
-        &mut self,
+        &self,
         parent: u64,
         name: &str,
         target: &str,
         caller: &Caller,
     ) -> Result<EntryReply, Errno> {
-        let id = {
-            let Runtime { fs, table, .. } = self;
-            let mut cx = Cx { table };
-            fs.symlink(&mut cx, NodeId::from_ino(parent), name, target, caller)?
-        };
+        let id = self
+            .fs
+            .symlink(&self.cx(), NodeId::from_ino(parent), name, target, caller)?;
         self.entry_for(id, caller)
     }
-
     pub fn link(
-        &mut self,
+        &self,
         ino: u64,
         newparent: u64,
         newname: &str,
         caller: &Caller,
     ) -> Result<EntryReply, Errno> {
-        let id = {
-            let Runtime { fs, table, .. } = self;
-            let mut cx = Cx { table };
-            fs.link(
-                &mut cx,
-                NodeId::from_ino(ino),
-                NodeId::from_ino(newparent),
-                newname,
-                caller,
-            )?
-        };
+        let id = self.fs.link(
+            &self.cx(),
+            NodeId::from_ino(ino),
+            NodeId::from_ino(newparent),
+            newname,
+            caller,
+        )?;
         self.entry_for(id, caller)
     }
-
-    pub fn unlink(&mut self, parent: u64, name: &str, caller: &Caller) -> Result<(), Errno> {
-        let Runtime { fs, table, .. } = self;
-        let mut cx = Cx { table };
-        fs.unlink(&mut cx, NodeId::from_ino(parent), name, caller)
+    pub fn unlink(&self, parent: u64, name: &str, caller: &Caller) -> Result<(), Errno> {
+        self.fs
+            .unlink(&self.cx(), NodeId::from_ino(parent), name, caller)
     }
-
-    pub fn rmdir(&mut self, parent: u64, name: &str, caller: &Caller) -> Result<(), Errno> {
-        let Runtime { fs, table, .. } = self;
-        let mut cx = Cx { table };
-        fs.rmdir(&mut cx, NodeId::from_ino(parent), name, caller)
+    pub fn rmdir(&self, parent: u64, name: &str, caller: &Caller) -> Result<(), Errno> {
+        self.fs
+            .rmdir(&self.cx(), NodeId::from_ino(parent), name, caller)
     }
-
     #[allow(clippy::too_many_arguments)]
     pub fn rename(
-        &mut self,
+        &self,
         parent: u64,
         name: &str,
         newparent: u64,
@@ -757,10 +739,8 @@ impl<F: NodeFs> Runtime<F> {
         flags: u32,
         caller: &Caller,
     ) -> Result<(), Errno> {
-        let Runtime { fs, table, .. } = self;
-        let mut cx = Cx { table };
-        fs.rename(
-            &mut cx,
+        self.fs.rename(
+            &self.cx(),
             NodeId::from_ino(parent),
             name,
             NodeId::from_ino(newparent),
@@ -771,7 +751,7 @@ impl<F: NodeFs> Runtime<F> {
     }
 
     pub fn create(
-        &mut self,
+        &self,
         parent: u64,
         name: &str,
         mode: u32,
@@ -779,14 +759,18 @@ impl<F: NodeFs> Runtime<F> {
         flags: i32,
         caller: &Caller,
     ) -> Result<(EntryReply, OpenReply), Errno> {
-        let (id, opened) = {
-            let Runtime { fs, table, .. } = self;
-            let mut cx = Cx { table };
-            fs.create(&mut cx, NodeId::from_ino(parent), name, mode, umask, flags, caller)?
-        };
+        let (id, opened) = self.fs.create(
+            &self.cx(),
+            NodeId::from_ino(parent),
+            name,
+            mode,
+            umask,
+            flags,
+            caller,
+        )?;
         let entry = self.entry_for(id, caller)?;
-        let fh = self.handles.alloc_file(opened.handle);
-        self.table.map.get_mut(&id.ino()).unwrap().opens += 1;
+        self.add_open(id.ino())?;
+        let fh = lock(&self.handles).add_file(opened.handle);
         Ok((
             entry,
             OpenReply {
@@ -798,7 +782,7 @@ impl<F: NodeFs> Runtime<F> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn copy_file_range(
-        &mut self,
+        &self,
         ino_in: u64,
         off_in: u64,
         ino_out: u64,
@@ -807,10 +791,8 @@ impl<F: NodeFs> Runtime<F> {
         flags: i32,
         caller: &Caller,
     ) -> Result<usize, Errno> {
-        let Runtime { fs, table, .. } = self;
-        let mut cx = Cx { table };
-        fs.copy_file_range(
-            &mut cx,
+        self.fs.copy_file_range(
+            &self.cx(),
             NodeId::from_ino(ino_in),
             off_in,
             NodeId::from_ino(ino_out),
@@ -822,253 +804,252 @@ impl<F: NodeFs> Runtime<F> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Tests: the runtime is fully exercisable without any FUSE mount.
-// ---------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attr::FileKind;
-    use std::collections::BTreeMap;
+    use crate::{FileKind, Opened};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Barrier, RwLock};
+    use std::thread;
 
     enum Data {
         Dir(BTreeMap<String, NodeId>),
         File(Vec<u8>),
     }
-
-    struct Node {
-        data: Data,
-    }
-
-    #[derive(Default)]
+    struct Node(RwLock<Data>);
     struct Mini;
-
-    impl Node {
-        fn dir() -> Node {
-            Node {
-                data: Data::Dir(BTreeMap::new()),
-            }
-        }
-        fn file() -> Node {
-            Node {
-                data: Data::File(Vec::new()),
-            }
-        }
-    }
-
     impl NodeFs for Mini {
         type Node = Node;
         type Handle = ();
         type DirHandle = ();
-
         fn root(&mut self) -> Node {
-            Node::dir()
+            Node(RwLock::new(Data::Dir(BTreeMap::new())))
         }
-
-        fn getattr(&mut self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
+        fn getattr(&self, n: &Node, _: &Caller) -> Result<NodeAttr, Errno> {
             Ok(NodeAttr {
-                kind: match node.data {
+                kind: match &*n.0.read().unwrap() {
                     Data::Dir(_) => FileKind::Directory,
                     Data::File(_) => FileKind::RegularFile,
                 },
-                perm: 0o644,
-                nlink: match node.data {
-                    // Deliberately distinctive so the test below catches
-                    // any runtime-side replacement of this value.
-                    Data::Dir(_) => 7,
-                    Data::File(_) => 1,
-                },
+                nlink: 1,
                 ..Default::default()
             })
         }
-
-        fn lookup(
-            &mut self,
-            cx: &mut Cx<'_, Node>,
-            parent: NodeId,
-            name: &str,
-            _c: &Caller,
-        ) -> Result<Option<NodeId>, Errno> {
-            let p = cx.get(parent).ok_or(Errno::ENOENT)?;
-            match &p.data {
-                Data::Dir(entries) => Ok(entries.get(name).copied()),
-                _ => Err(Errno::ENOTDIR),
-            }
-        }
-
         fn create(
-            &mut self,
-            cx: &mut Cx<'_, Node>,
+            &self,
+            cx: &Cx<'_, Node>,
             parent: NodeId,
             name: &str,
-            _mode: u32,
-            _umask: u32,
-            _flags: i32,
-            _c: &Caller,
+            _: u32,
+            _: u32,
+            _: i32,
+            _: &Caller,
         ) -> Result<(NodeId, Opened<()>), Errno> {
-            let id = cx.insert(Node::file(), parent);
-            if let Some(Data::Dir(entries)) = cx.get_mut(parent).map(|n| &mut n.data) {
-                entries.insert(name.to_string(), id);
+            let id = cx.insert(Node(RwLock::new(Data::File(Vec::new()))), parent);
+            let p = cx.get(parent).ok_or(Errno::ENOENT)?;
+            if let Data::Dir(e) = &mut *p.0.write().unwrap() {
+                e.insert(name.into(), id);
             }
             Ok((id, Opened::new(())))
         }
-
         fn unlink(
-            &mut self,
-            cx: &mut Cx<'_, Node>,
+            &self,
+            cx: &Cx<'_, Node>,
             parent: NodeId,
             name: &str,
-            _c: &Caller,
+            _: &Caller,
         ) -> Result<(), Errno> {
-            let id = match cx.get_mut(parent).map(|n| &mut n.data) {
-                Some(Data::Dir(entries)) => entries.remove(name).ok_or(Errno::ENOENT)?,
+            let p = cx.get(parent).ok_or(Errno::ENOENT)?;
+            let id = match &mut *p.0.write().unwrap() {
+                Data::Dir(e) => e.remove(name).ok_or(Errno::ENOENT)?,
                 _ => return Err(Errno::ENOTDIR),
             };
             cx.remove_link(id);
             Ok(())
         }
-
         fn read<'a>(
-            &'a mut self,
-            node: &'a mut Node,
-            _h: &'a mut (),
-            offset: u64,
+            &'a self,
+            n: &'a Node,
+            _: &'a (),
+            off: u64,
             size: usize,
-            _c: &Caller,
+            _: &Caller,
         ) -> Result<Cow<'a, [u8]>, Errno> {
-            if let Data::File(content) = &node.data {
-                let off = offset as usize;
-                if off >= content.len() {
-                    return Ok(Cow::Borrowed(&[]));
-                }
-                let end = (off + size).min(content.len());
-                Ok(Cow::Borrowed(&content[off..end]))
-            } else {
-                Err(Errno::EISDIR)
+            match &*n.0.read().unwrap() {
+                Data::File(v) => Ok(Cow::Owned(
+                    v.get(off as usize..).unwrap_or_default()
+                        [..size.min(v.len().saturating_sub(off as usize))]
+                        .to_vec(),
+                )),
+                _ => Err(Errno::EISDIR),
             }
         }
     }
-
-    use crate::node_fs::Opened;
-
     fn caller() -> Caller {
         Caller::default()
     }
-
-    // Test accessors.
-    impl<F: NodeFs> Runtime<F> {
-        fn node_count(&self) -> usize {
-            self.table.map.len()
-        }
-        fn counts(&self, ino: u64) -> Option<(u32, u64, u32)> {
-            self.table
-                .map
-                .get(&ino)
-                .map(|s| (s.links, s.lookups, s.opens))
-        }
-        fn generation(&self, ino: u64) -> Option<u64> {
-            self.table.map.get(&ino).map(|s| s.generation)
-        }
+    fn counts(rt: &Runtime<Mini>, ino: u64) -> Option<(u32, u64, u32, u32)> {
+        lock(&rt.shared.table)
+            .map
+            .get(&ino)
+            .map(|s| (s.links, s.lookups, s.opens, s.leases))
     }
 
     #[test]
-    fn root_seeded() {
+    fn lifetime_and_generation() {
         let rt = Runtime::new(Mini);
-        assert_eq!(rt.node_count(), 1);
-        assert_eq!(rt.counts(NodeId::ROOT.ino()), Some((1, 0, 0)));
+        let (e, o) = rt.create(1, "f", 0, 0, 0, &caller()).unwrap();
+        assert_eq!(counts(&rt, e.ino), Some((1, 1, 1, 0)));
+        rt.unlink(1, "f", &caller()).unwrap();
+        rt.forget(e.ino, 1);
+        rt.release(e.ino, o.fh, &caller()).unwrap();
+        assert_eq!(counts(&rt, e.ino), None);
+        let (e2, _) = rt.create(1, "g", 0, 0, 0, &caller()).unwrap();
+        assert_eq!(e2.ino, e.ino);
+        assert_eq!(e2.generation, 1);
+    }
+
+    struct Overlap {
+        barrier: Arc<Barrier>,
+    }
+    impl NodeFs for Overlap {
+        type Node = ();
+        type Handle = ();
+        type DirHandle = ();
+        fn root(&mut self) {}
+        fn getattr(&self, _: &(), _: &Caller) -> Result<NodeAttr, Errno> {
+            self.barrier.wait();
+            Ok(NodeAttr::default())
+        }
+    }
+    #[test]
+    fn callbacks_really_overlap() {
+        let rt = Arc::new(Runtime::new(Overlap {
+            barrier: Arc::new(Barrier::new(2)),
+        }));
+        let a = Arc::clone(&rt);
+        let b = Arc::clone(&rt);
+        let t1 = thread::spawn(move || a.getattr(1, &caller()).unwrap());
+        let t2 = thread::spawn(move || b.getattr(1, &caller()).unwrap());
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 
     #[test]
-    fn create_allocates_inode_and_counts_lookup() {
-        let mut rt = Runtime::new(Mini);
-        let (entry, _open) = rt
-            .create(NodeId::ROOT.ino(), "f", 0o644, 0, 0, &caller())
-            .unwrap();
-        assert_eq!(entry.ino, 2);
-        // one directory link, one kernel lookup (from the entry reply), one
-        // open handle (create opens the file).
-        assert_eq!(rt.counts(2), Some((1, 1, 1)));
+    fn node_lease_defers_reuse() {
+        let rt = Runtime::new(Mini);
+        let (e, o) = rt.create(1, "f", 0, 0, 0, &caller()).unwrap();
+        let lease = rt.node(e.ino).unwrap();
+        rt.unlink(1, "f", &caller()).unwrap();
+        rt.forget(e.ino, 1);
+        rt.release(e.ino, o.fh, &caller()).unwrap();
+        assert!(counts(&rt, e.ino).is_some());
+        drop(lease);
+        assert!(counts(&rt, e.ino).is_none());
     }
 
+    struct BlockingHandle {
+        entered: Arc<Barrier>,
+        finish: Arc<Barrier>,
+    }
+    impl Default for BlockingHandle {
+        fn default() -> Self {
+            Self {
+                entered: Arc::new(Barrier::new(1)),
+                finish: Arc::new(Barrier::new(1)),
+            }
+        }
+    }
+    struct HandleOverlap {
+        entered: Arc<Barrier>,
+        finish: Arc<Barrier>,
+        releases: Arc<AtomicUsize>,
+    }
+    impl NodeFs for HandleOverlap {
+        type Node = ();
+        type Handle = BlockingHandle;
+        type DirHandle = ();
+        fn root(&mut self) {}
+        fn getattr(&self, _: &(), _: &Caller) -> Result<NodeAttr, Errno> {
+            Ok(NodeAttr::default())
+        }
+        fn open(&self, _: &(), _: i32, _: &Caller) -> Result<crate::Opened<BlockingHandle>, Errno> {
+            Ok(crate::Opened::new(BlockingHandle {
+                entered: Arc::clone(&self.entered),
+                finish: Arc::clone(&self.finish),
+            }))
+        }
+        fn read<'a>(
+            &'a self,
+            _: &'a (),
+            h: &'a BlockingHandle,
+            _: u64,
+            _: usize,
+            _: &Caller,
+        ) -> Result<Cow<'a, [u8]>, Errno> {
+            h.entered.wait();
+            h.finish.wait();
+            Ok(Cow::Borrowed(&[]))
+        }
+        fn release(&self, _: &(), _: BlockingHandle, _: &Caller) -> Result<(), Errno> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
     #[test]
-    fn getattr_preserves_filesystem_nlink() {
-        let mut rt = Runtime::new(Mini);
-        let attr = rt.getattr(NodeId::ROOT.ino(), &caller()).unwrap();
-        assert_eq!(attr.nlink, 7);
+    fn release_waits_for_same_handle_callback_and_consumes_once() {
+        let entered = Arc::new(Barrier::new(2));
+        let finish = Arc::new(Barrier::new(2));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let rt = Arc::new(Runtime::new(HandleOverlap {
+            entered: Arc::clone(&entered),
+            finish: Arc::clone(&finish),
+            releases: Arc::clone(&releases),
+        }));
+        let open = rt.open(1, 0, &caller()).unwrap();
+        let reader = Arc::clone(&rt);
+        let read_thread = thread::spawn(move || {
+            reader
+                .read(1, open.fh, 0, 1, &caller(), |r| r.map(|_| ()))
+                .unwrap()
+        });
+        entered.wait();
+        let closer = Arc::clone(&rt);
+        let (tx, rx) = mpsc::channel();
+        let close_thread = thread::spawn(move || {
+            tx.send(closer.release(1, open.fh, &caller())).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        finish.wait();
+        read_thread.join().unwrap();
+        rx.recv().unwrap().unwrap();
+        close_thread.join().unwrap();
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert_eq!(rt.release(1, open.fh, &caller()).unwrap_err(), Errno::EBADF);
     }
 
-    #[test]
-    fn unlink_while_open_defers_drop() {
-        let mut rt = Runtime::new(Mini);
-        let (entry, open) = rt
-            .create(NodeId::ROOT.ino(), "f", 0o644, 0, 0, &caller())
-            .unwrap();
-        let ino = entry.ino;
-
-        // unlink: link count drops to 0, but the node is still looked-up and
-        // open, so it must survive.
-        rt.unlink(NodeId::ROOT.ino(), "f", &caller()).unwrap();
-        assert_eq!(rt.counts(ino), Some((0, 1, 1)));
-
-        // reading through the open handle still resolves the node (it would
-        // be ENOENT if the node had been dropped on unlink).
-        assert!(rt.read(ino, open.fh, 0, 10, &caller()).is_ok());
-
-        // forget the kernel reference: still open, still alive.
-        rt.forget(ino, 1);
-        assert_eq!(rt.counts(ino), Some((0, 0, 1)));
-
-        // close: now fully unreferenced -> dropped, inode reclaimed.
-        rt.release(ino, open.fh, &caller()).unwrap();
-        assert_eq!(rt.counts(ino), None);
+    struct PanicOnce(AtomicBool);
+    impl NodeFs for PanicOnce {
+        type Node = ();
+        type Handle = ();
+        type DirHandle = ();
+        fn root(&mut self) {}
+        fn getattr(&self, _: &(), _: &Caller) -> Result<NodeAttr, Errno> {
+            if self.0.swap(false, Ordering::SeqCst) {
+                panic!("boom")
+            }
+            Ok(NodeAttr::default())
+        }
     }
-
     #[test]
-    fn inode_reused_with_bumped_generation() {
-        let mut rt = Runtime::new(Mini);
-        let (entry, open) = rt
-            .create(NodeId::ROOT.ino(), "f", 0o644, 0, 0, &caller())
-            .unwrap();
-        let ino = entry.ino;
-        assert_eq!(rt.generation(ino), Some(0));
-
-        rt.unlink(NodeId::ROOT.ino(), "f", &caller()).unwrap();
-        rt.forget(ino, 1);
-        rt.release(ino, open.fh, &caller()).unwrap();
-        assert_eq!(rt.counts(ino), None);
-
-        // Next create should reuse the inode with generation bumped to 1.
-        let (entry2, _open2) = rt
-            .create(NodeId::ROOT.ino(), "g", 0o644, 0, 0, &caller())
-            .unwrap();
-        assert_eq!(entry2.ino, ino);
-        assert_eq!(rt.generation(ino), Some(1));
-    }
-
-    #[test]
-    fn forget_saturates_and_missing_node_is_noop() {
-        let mut rt = Runtime::new(Mini);
-        // forgetting an unknown inode does nothing and does not panic.
-        rt.forget(999, 5);
-        // over-forgetting saturates rather than underflowing.
-        let (entry, open) = rt
-            .create(NodeId::ROOT.ino(), "f", 0o644, 0, 0, &caller())
-            .unwrap();
-        rt.forget(entry.ino, 100);
-        assert_eq!(rt.counts(entry.ino), Some((1, 0, 1)));
-        rt.release(entry.ino, open.fh, &caller()).unwrap();
-    }
-
-    #[test]
-    fn read_missing_handle_is_ebadf() {
-        let mut rt = Runtime::new(Mini);
-        let (entry, _open) = rt
-            .create(NodeId::ROOT.ino(), "f", 0o644, 0, 0, &caller())
-            .unwrap();
-        assert_eq!(
-            rt.read(entry.ino, 4242, 0, 10, &caller()).unwrap_err(),
-            Errno::EBADF
-        );
+    fn panic_drops_node_lease_and_runtime_remains_usable() {
+        let rt = Runtime::new(PanicOnce(AtomicBool::new(true)));
+        assert!(std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| rt.getattr(1, &caller()))
+        )
+        .is_err());
+        assert!(rt.getattr(1, &caller()).is_ok());
+        assert_eq!(lock(&rt.shared.table).map.get(&1).unwrap().leases, 0);
     }
 }

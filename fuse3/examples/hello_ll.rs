@@ -9,17 +9,20 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::RwLock;
 use std::time::SystemTime;
 
-use fuse3::{
-    Caller, Cx, Errno, FileKind, NodeAttr, NodeFs, NodeId, Opened, Session,
-};
+use fuse3::{Caller, Cx, Errno, FileKind, NodeAttr, NodeFs, NodeId, Opened, Session};
 
 const HELLO_CONTENT: &[u8] = b"Hello World!\n";
 
 enum Node {
-    Dir { entries: BTreeMap<String, NodeId> },
-    File { content: &'static [u8] },
+    Dir {
+        entries: RwLock<BTreeMap<String, NodeId>>,
+    },
+    File {
+        content: &'static [u8],
+    },
 }
 
 struct HelloFs {
@@ -30,9 +33,7 @@ impl HelloFs {
     fn attr_of(&self, node: &Node) -> NodeAttr {
         let (kind, perm, size, nlink) = match node {
             Node::Dir { .. } => (FileKind::Directory, 0o755, 0, 2),
-            Node::File { content } => {
-                (FileKind::RegularFile, 0o444, content.len() as u64, 1)
-            }
+            Node::File { content } => (FileKind::RegularFile, 0o444, content.len() as u64, 1),
         };
         NodeAttr {
             kind,
@@ -55,41 +56,43 @@ impl NodeFs for HelloFs {
 
     fn root(&mut self) -> Node {
         Node::Dir {
-            entries: BTreeMap::new(),
+            entries: RwLock::new(BTreeMap::new()),
         }
     }
 
-    fn populate(&mut self, cx: &mut Cx<'_, Node>) {
+    fn populate(&mut self, cx: &Cx<'_, Node>) {
         let hello = cx.insert(
             Node::File {
                 content: HELLO_CONTENT,
             },
             NodeId::ROOT,
         );
-        if let Some(Node::Dir { entries }) = cx.get_mut(NodeId::ROOT) {
-            entries.insert("hello".to_string(), hello);
+        if let Some(root) = cx.get(NodeId::ROOT) {
+            if let Node::Dir { entries } = &*root {
+                entries.write().unwrap().insert("hello".to_string(), hello);
+            }
         }
     }
 
-    fn getattr(&mut self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
+    fn getattr(&self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
         Ok(self.attr_of(node))
     }
 
     fn lookup(
-        &mut self,
-        cx: &mut Cx<'_, Node>,
+        &self,
+        cx: &Cx<'_, Node>,
         parent: NodeId,
         name: &str,
         _c: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
-        match cx.get(parent) {
-            Some(Node::Dir { entries }) => Ok(entries.get(name).copied()),
+        match cx.get(parent).as_deref() {
+            Some(Node::Dir { entries }) => Ok(entries.read().unwrap().get(name).copied()),
             Some(_) => Err(Errno::ENOTDIR),
             None => Err(Errno::ENOENT),
         }
     }
 
-    fn open(&mut self, node: &mut Node, _flags: i32, _c: &Caller) -> Result<Opened<()>, Errno> {
+    fn open(&self, node: &Node, _flags: i32, _c: &Caller) -> Result<Opened<()>, Errno> {
         match node {
             Node::File { .. } => Ok(Opened::new(())),
             Node::Dir { .. } => Err(Errno::EISDIR),
@@ -97,9 +100,9 @@ impl NodeFs for HelloFs {
     }
 
     fn read<'a>(
-        &'a mut self,
-        node: &'a mut Node,
-        _h: &'a mut (),
+        &'a self,
+        node: &'a Node,
+        _h: &'a (),
         offset: u64,
         size: usize,
         _c: &Caller,
@@ -116,11 +119,11 @@ impl NodeFs for HelloFs {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         node: &Node,
         this: NodeId,
         parent: NodeId,
-        _dh: &mut (),
+        _dh: &(),
         offset: u64,
         sink: &mut dyn fuse3::DirSink,
         _c: &Caller,
@@ -145,6 +148,7 @@ impl NodeFs for HelloFs {
         }
 
         let skip = (cursor - 2) as usize;
+        let entries = entries.read().unwrap();
         for (i, (name, &id)) in entries.iter().enumerate().skip(skip) {
             let next_offset = (i + 3) as u64;
             if !sink.add(name, id, FileKind::RegularFile, next_offset) {
