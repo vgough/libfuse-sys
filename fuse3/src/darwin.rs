@@ -18,7 +18,9 @@
 //! See the root crate's `examples/hello_ll.rs` (lines 44-65) for the original
 //! version of this workaround, and the `darwin-symbol-aliasing` memory note.
 
-use libfuse_sys::fuse_lowlevel::{fuse_entry_param, fuse_file_info, fuse_req_t, off_t, statfs, stat};
+use libfuse_sys::fuse_lowlevel::{
+    fuse_entry_param, fuse_file_info, fuse_req_t, off_t, stat, statfs,
+};
 use std::os::raw::{c_char, c_int};
 
 type Attr = stat;

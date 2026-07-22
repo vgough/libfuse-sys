@@ -4,6 +4,10 @@
 #![allow(clippy::useless_transmute)]
 #![allow(clippy::cognitive_complexity)]
 #![allow(clippy::missing_safety_doc)]
+// Generated bindgen pointer arithmetic and bitfield constructors intentionally
+// use these shapes; suppress them at the raw-binding crate boundary.
+#![allow(clippy::ptr_offset_with_cast)]
+#![allow(clippy::too_many_arguments)]
 
 #[cfg(feature = "fuse_highlevel")]
 use libc::*;

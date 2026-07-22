@@ -1,6 +1,8 @@
 //! The [`NodeFs`] trait and the value types it exchanges with the runtime.
 
 use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use crate::attr::{FileKind, NodeAttr, SetAttr, StatFs};
 use crate::errno::Errno;
@@ -194,7 +196,39 @@ pub trait DirSink {
     /// Adds one entry. `next_offset` is the resume cookie the kernel will
     /// hand back to continue after this entry. Returns `false` once the
     /// buffer is full, at which point the caller must stop iterating.
-    fn add(&mut self, name: &str, id: NodeId, kind: FileKind, next_offset: u64) -> bool;
+    fn add(&mut self, name: &OsStr, id: NodeId, kind: FileKind, next_offset: u64) -> bool;
+}
+
+/// A sink [`NodeFs::readdirplus`] pushes directory entries (with attributes)
+/// into. Like [`DirSink`], but each entry carries a [`NodeAttr`] so the
+/// kernel can populate its attribute cache and skip a follow-up `lookup`.
+pub trait PlusDirSink {
+    /// Adds one entry with its attributes. `next_offset` is the resume
+    /// cookie the kernel will hand back to continue after this entry.
+    /// Returns `false` once the buffer is full, at which point the caller
+    /// must stop iterating.
+    fn add(&mut self, name: &OsStr, id: NodeId, attr: NodeAttr, next_offset: u64) -> bool;
+}
+
+/// The kind of a POSIX record lock, as used by [`NodeFs::getlk`] and
+/// [`NodeFs::setlk`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockKind {
+    Read,
+    Write,
+    /// Releases a previously held lock over the range.
+    Unlock,
+}
+
+/// A POSIX record lock request or reply, covering the byte range
+/// `[start, end]` inclusive (`end == u64::MAX` means "to end of file").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileLock {
+    pub kind: LockKind,
+    pub start: u64,
+    pub end: u64,
+    /// The process id holding or requesting the lock.
+    pub pid: u32,
 }
 
 /// The safe, node-based FUSE filesystem interface.
@@ -218,9 +252,19 @@ pub trait NodeFs: Sized + Send + Sync {
     /// Per-node data owned and stored by the runtime.
     type Node: Send + Sync;
     /// Per-open-file data. Use `()` if the filesystem is stateless per open.
-    type Handle: Default + Send + Sync;
+    type Handle: Send + Sync;
     /// Per-open-directory data. Use `()` if not needed.
-    type DirHandle: Default + Send + Sync;
+    type DirHandle: Send + Sync;
+
+    /// Set to `true` to register the `getlk`/`setlk` callbacks and enable
+    /// [`NodeFs::getlk`]/[`NodeFs::setlk`]. Left disabled by default since
+    /// most filesystems delegate POSIX locking to the kernel.
+    const SUPPORTS_POSIX_LOCKS: bool = false;
+    /// Set to `true` to register the `readdirplus` callback and enable
+    /// [`NodeFs::readdirplus`], letting the kernel populate its attribute
+    /// cache from directory listings instead of a follow-up `lookup` per
+    /// entry.
+    const SUPPORTS_READDIRPLUS: bool = false;
 
     /// Builds the payload for the root directory. Called once, when the
     /// runtime is constructed.
@@ -239,13 +283,22 @@ pub trait NodeFs: Sized + Send + Sync {
     fn destroy(&self) {}
 
     /// Returns the attributes of `node`, including its current link count.
-    fn getattr(&self, node: &Self::Node, caller: &Caller) -> Result<NodeAttr, Errno>;
+    /// `handle` is the open file/dir handle if the call arrived through one,
+    /// or `None` (e.g. an `fstat` on a path rather than a descriptor).
+    fn getattr(
+        &self,
+        node: &Self::Node,
+        handle: Option<&Self::Handle>,
+        caller: &Caller,
+    ) -> Result<NodeAttr, Errno>;
 
     /// Applies the `Some` fields of `set` to `node`, returning the resulting
-    /// attributes.
+    /// attributes. `handle` is the open handle if the call arrived through
+    /// one, or `None` otherwise.
     fn setattr(
         &self,
         node: &Self::Node,
+        handle: Option<&Self::Handle>,
         set: &SetAttr,
         caller: &Caller,
     ) -> Result<NodeAttr, Errno> {
@@ -259,14 +312,14 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         caller: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
         Err(Errno::ENOSYS)
     }
 
     /// Reads the target of the symbolic link `node`.
-    fn readlink(&self, node: &Self::Node, caller: &Caller) -> Result<String, Errno> {
+    fn readlink(&self, node: &Self::Node, caller: &Caller) -> Result<PathBuf, Errno> {
         Err(Errno::ENOSYS)
     }
 
@@ -278,7 +331,7 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         mode: u32,
         rdev: u32,
         umask: u32,
@@ -292,7 +345,7 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         mode: u32,
         umask: u32,
         caller: &Caller,
@@ -305,8 +358,8 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
-        target: &str,
+        name: &OsStr,
+        target: &Path,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         Err(Errno::ENOSYS)
@@ -319,7 +372,7 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
@@ -330,7 +383,7 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         caller: &Caller,
     ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
@@ -342,9 +395,9 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         newparent: NodeId,
-        newname: &str,
+        newname: &OsStr,
         flags: u32,
         caller: &Caller,
     ) -> Result<(), Errno> {
@@ -358,7 +411,7 @@ pub trait NodeFs: Sized + Send + Sync {
         cx: &Cx<'_, Self::Node>,
         id: NodeId,
         newparent: NodeId,
-        newname: &str,
+        newname: &OsStr,
         caller: &Caller,
     ) -> Result<NodeId, Errno> {
         Err(Errno::ENOSYS)
@@ -371,7 +424,7 @@ pub trait NodeFs: Sized + Send + Sync {
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<Self::Handle>, Errno> {
-        Ok(Opened::new(Self::Handle::default()))
+        Err(Errno::ENOSYS)
     }
 
     /// Reads up to `size` bytes from `node` at `offset`. The returned data
@@ -439,7 +492,7 @@ pub trait NodeFs: Sized + Send + Sync {
         flags: i32,
         caller: &Caller,
     ) -> Result<Opened<Self::DirHandle>, Errno> {
-        Ok(Opened::new(Self::DirHandle::default()))
+        Err(Errno::ENOSYS)
     }
 
     /// Emits the entries of directory `node` into `sink`, starting at
@@ -450,12 +503,31 @@ pub trait NodeFs: Sized + Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn readdir(
         &self,
+        cx: &Cx<'_, Self::Node>,
         node: &Self::Node,
         this: NodeId,
         parent: NodeId,
         handle: &Self::DirHandle,
         offset: u64,
         sink: &mut dyn DirSink,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Like [`NodeFs::readdir`], but emits attributes alongside each entry
+    /// via [`PlusDirSink`]. Only called when [`NodeFs::SUPPORTS_READDIRPLUS`]
+    /// is `true`.
+    #[allow(clippy::too_many_arguments)]
+    fn readdirplus(
+        &self,
+        cx: &Cx<'_, Self::Node>,
+        node: &Self::Node,
+        this: NodeId,
+        parent: NodeId,
+        handle: &Self::DirHandle,
+        offset: u64,
+        sink: &mut dyn PlusDirSink,
         caller: &Caller,
     ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
@@ -496,7 +568,7 @@ pub trait NodeFs: Sized + Send + Sync {
     fn setxattr(
         &self,
         node: &Self::Node,
-        name: &str,
+        name: &OsStr,
         value: &[u8],
         flags: i32,
         caller: &Caller,
@@ -509,7 +581,7 @@ pub trait NodeFs: Sized + Send + Sync {
     fn getxattr(
         &self,
         node: &Self::Node,
-        name: &str,
+        name: &OsStr,
         size: usize,
         caller: &Caller,
     ) -> Result<XattrReply, Errno> {
@@ -528,7 +600,7 @@ pub trait NodeFs: Sized + Send + Sync {
     }
 
     /// Removes extended attribute `name` from `node`.
-    fn removexattr(&self, node: &Self::Node, name: &str, caller: &Caller) -> Result<(), Errno> {
+    fn removexattr(&self, node: &Self::Node, name: &OsStr, caller: &Caller) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
 
@@ -543,7 +615,7 @@ pub trait NodeFs: Sized + Send + Sync {
         &self,
         cx: &Cx<'_, Self::Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         mode: u32,
         umask: u32,
         flags: i32,
@@ -574,6 +646,37 @@ pub trait NodeFs: Sized + Send + Sync {
         whence: i32,
         caller: &Caller,
     ) -> Result<u64, Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Tests whether `lock` could be acquired on `node` by `owner`, returning
+    /// the conflicting lock (or `lock` itself with [`LockKind::Unlock`] if it
+    /// would succeed). Only called when [`NodeFs::SUPPORTS_POSIX_LOCKS`] is
+    /// `true`.
+    fn getlk(
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        caller: &Caller,
+    ) -> Result<FileLock, Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// Acquires or releases `lock` on `node` for `owner`. If `sleep` is
+    /// `true`, block until the lock is available rather than failing
+    /// immediately. Only called when [`NodeFs::SUPPORTS_POSIX_LOCKS`] is
+    /// `true`.
+    fn setlk(
+        &self,
+        node: &Self::Node,
+        handle: &Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        sleep: bool,
+        caller: &Caller,
+    ) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
     }
 

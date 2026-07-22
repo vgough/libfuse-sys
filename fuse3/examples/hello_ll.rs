@@ -9,6 +9,8 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -74,7 +76,7 @@ impl NodeFs for HelloFs {
         }
     }
 
-    fn getattr(&self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
+    fn getattr(&self, node: &Node, _h: Option<&()>, _c: &Caller) -> Result<NodeAttr, Errno> {
         Ok(self.attr_of(node))
     }
 
@@ -82,11 +84,15 @@ impl NodeFs for HelloFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         _c: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
         match cx.get(parent).as_deref() {
-            Some(Node::Dir { entries }) => Ok(entries.read().unwrap().get(name).copied()),
+            Some(Node::Dir { entries }) => Ok(entries
+                .read()
+                .unwrap()
+                .get(&name.to_string_lossy().into_owned())
+                .copied()),
             Some(_) => Err(Errno::ENOTDIR),
             None => Err(Errno::ENOENT),
         }
@@ -120,6 +126,7 @@ impl NodeFs for HelloFs {
 
     fn readdir(
         &self,
+        _cx: &Cx<'_, Node>,
         node: &Node,
         this: NodeId,
         parent: NodeId,
@@ -135,13 +142,13 @@ impl NodeFs for HelloFs {
         // Offsets: 1 => ".", 2 => "..", 3.. => real entries.
         let mut cursor = offset;
         if cursor < 1 {
-            if !sink.add(".", this, FileKind::Directory, 1) {
+            if !sink.add(OsStr::new("."), this, FileKind::Directory, 1) {
                 return Ok(());
             }
             cursor = 1;
         }
         if cursor < 2 {
-            if !sink.add("..", parent, FileKind::Directory, 2) {
+            if !sink.add(OsStr::new(".."), parent, FileKind::Directory, 2) {
                 return Ok(());
             }
             cursor = 2;
@@ -151,7 +158,7 @@ impl NodeFs for HelloFs {
         let entries = entries.read().unwrap();
         for (i, (name, &id)) in entries.iter().enumerate().skip(skip) {
             let next_offset = (i + 3) as u64;
-            if !sink.add(name, id, FileKind::RegularFile, next_offset) {
+            if !sink.add(OsStr::new(name), id, FileKind::RegularFile, next_offset) {
                 break;
             }
         }
@@ -172,7 +179,7 @@ fn main() {
         mounted_at: SystemTime::now(),
     };
 
-    if let Err(e) = Session::mount_and_run(fs, &mountpoint, &[]) {
+    if let Err(e) = Session::mount_and_run(fs, Path::new(&mountpoint), &[]) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

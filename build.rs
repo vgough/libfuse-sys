@@ -159,7 +159,7 @@ fn generate_fuse_bindings(
 
     // Write bindings to file
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let bindings_path = out_dir.join(&header.replace(".h", ".rs"));
+    let bindings_path = out_dir.join(header.replace(".h", ".rs"));
     bindings
         .write_to_file(&bindings_path)
         .unwrap_or_else(|_| panic!("Failed to write {}", bindings_path.display()));

@@ -15,11 +15,16 @@
 mod attr;
 mod errno;
 mod node_fs;
+mod path_fs;
 mod runtime;
 
 pub use attr::{FileKind, NodeAttr, SetAttr, StatFs, TimeOrNow};
 pub use errno::Errno;
 pub use node_fs::{
-    Caller, ConnInfo, ConnectionCapability, DirSink, NodeFs, NodeId, OpenHints, Opened, XattrReply,
+    Caller, ConnInfo, ConnectionCapability, DirSink, FileLock, LockKind, NodeFs, NodeId, OpenHints,
+    Opened, PlusDirSink, XattrReply,
 };
-pub use runtime::{Cx, EntryReply, LookupReply, NodeRef, NodeTable, OpenReply, Runtime};
+pub use path_fs::{PathDirSink, PathFilesystem, PathNode, PathNodeFs, PathPlusDirSink};
+pub use runtime::{
+    Cx, EntryReply, LookupReply, NodeRef, NodeTable, OpenReply, Runtime, RuntimePlusSink,
+};

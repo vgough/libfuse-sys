@@ -4,13 +4,17 @@
 
 #![allow(clippy::unnecessary_cast)]
 
+use std::ffi::OsStr;
 use std::os::raw::c_char;
+use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
 use libfuse_sys::fuse_lowlevel::{
     fuse_conn_info, fuse_entry_param, fuse_file_info, fuse_req_t, stat,
 };
-use typed_fuse_core::{ConnInfo, DirSink, FileKind, NodeId, OpenHints};
+use typed_fuse_core::{
+    ConnInfo, DirSink, EntryReply, FileKind, NodeId, OpenHints, RuntimePlusSink,
+};
 
 use crate::conv::kind_to_mode_bits;
 
@@ -78,6 +82,10 @@ pub(crate) fn fi_fh(fi: *mut fuse_file_info) -> u64 {
     }
 }
 
+pub(crate) fn fi_fh_opt(fi: *mut fuse_file_info) -> Option<u64> {
+    (!fi.is_null()).then(|| unsafe { (*fi).fh })
+}
+
 /// The open flags carried in a (possibly null) `fuse_file_info`.
 pub(crate) fn fi_flags(fi: *mut fuse_file_info) -> i32 {
     if fi.is_null() {
@@ -139,7 +147,7 @@ enum Format {
     /// `fuse_entry_param` (nodeid 0, so the kernel performs no lookup and
     /// needs no matching `forget`). Used to answer READDIRPLUS from the
     /// filesystem's plain `readdir` output.
-    PlusFallback,
+    Plus,
 }
 
 /// A `readdir` reply builder implementing libfuse's size-limited buffer
@@ -150,6 +158,7 @@ pub(crate) struct DirBuffer {
     capacity: usize,
     buf: Vec<u8>,
     format: Format,
+    ttl: std::time::Duration,
 }
 
 impl DirBuffer {
@@ -159,17 +168,18 @@ impl DirBuffer {
             capacity: size,
             buf: Vec::with_capacity(size),
             format: Format::Plain,
+            ttl: std::time::Duration::ZERO,
         }
     }
 
-    /// Like [`DirBuffer::new`], but emits READDIRPLUS-shaped entries (nodeid
-    /// 0). See [`Format::PlusFallback`].
-    pub(crate) fn new_plus_fallback(req: fuse_req_t, size: usize) -> Self {
+    /// Like [`DirBuffer::new`], but emits attribute-carrying READDIRPLUS entries.
+    pub(crate) fn new_plus(req: fuse_req_t, size: usize, ttl: std::time::Duration) -> Self {
         DirBuffer {
             req,
             capacity: size,
             buf: Vec::with_capacity(size),
-            format: Format::PlusFallback,
+            format: Format::Plus,
+            ttl,
         }
     }
 
@@ -179,10 +189,10 @@ impl DirBuffer {
 }
 
 impl DirSink for DirBuffer {
-    fn add(&mut self, name: &str, id: NodeId, kind: FileKind, next_offset: u64) -> bool {
+    fn add(&mut self, name: &OsStr, id: NodeId, kind: FileKind, next_offset: u64) -> bool {
         // Real filenames never contain interior NULs; silently skip if one
         // somehow does rather than aborting the whole listing.
-        let cname = match std::ffi::CString::new(name) {
+        let cname = match std::ffi::CString::new(name.as_bytes()) {
             Ok(c) => c,
             Err(_) => return true,
         };
@@ -209,37 +219,35 @@ impl DirSink for DirBuffer {
                     next_offset as _,
                 );
             }
-            Format::PlusFallback => {
-                let param = fuse_entry_param {
-                    ino: 0,
-                    generation: 0,
-                    attr: st,
-                    attr_timeout: 0.0,
-                    entry_timeout: 0.0,
-                };
-                let entry_size = raw_add_direntry_plus(
-                    self.req,
-                    ptr::null_mut(),
-                    0,
-                    cname.as_ptr(),
-                    ptr::null(),
-                    0,
-                );
-                if self.buf.len() + entry_size > self.capacity {
-                    return false;
-                }
-                let old_len = self.buf.len();
-                self.buf.resize(old_len + entry_size, 0);
-                raw_add_direntry_plus(
-                    self.req,
-                    unsafe { self.buf.as_mut_ptr().add(old_len) } as *mut c_char,
-                    entry_size,
-                    cname.as_ptr(),
-                    &param,
-                    next_offset as _,
-                );
-            }
+            Format::Plus => unreachable!("plus entries require attributes"),
         }
+        true
+    }
+}
+
+impl RuntimePlusSink for DirBuffer {
+    fn add(&mut self, name: &OsStr, entry: EntryReply, next_offset: u64) -> bool {
+        let cname = match std::ffi::CString::new(name.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return true,
+        };
+        let param =
+            crate::conv::entry_to_entry_param(entry.ino, entry.generation, &entry.attr, self.ttl);
+        let entry_size =
+            raw_add_direntry_plus(self.req, ptr::null_mut(), 0, cname.as_ptr(), &param, 0);
+        if self.buf.len() + entry_size > self.capacity {
+            return false;
+        }
+        let old_len = self.buf.len();
+        self.buf.resize(old_len + entry_size, 0);
+        raw_add_direntry_plus(
+            self.req,
+            unsafe { self.buf.as_mut_ptr().add(old_len) } as *mut c_char,
+            entry_size,
+            cname.as_ptr(),
+            &param,
+            next_offset as _,
+        );
         true
     }
 }
@@ -248,6 +256,14 @@ impl DirSink for DirBuffer {
 mod tests {
     use super::*;
     use typed_fuse_core::ConnectionCapability;
+
+    #[test]
+    fn optional_file_info_distinguishes_null_from_handle_zero() {
+        assert_eq!(fi_fh_opt(std::ptr::null_mut()), None);
+        let mut fi: fuse_file_info = unsafe { std::mem::zeroed() };
+        fi.fh = 0;
+        assert_eq!(fi_fh_opt(&mut fi), Some(0));
+    }
 
     #[test]
     fn parallel_direct_writes_requires_direct_io() {

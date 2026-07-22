@@ -25,13 +25,13 @@ If no version is selected the crate defaults to version 35.
 
 ## Example
 
-`examples/hello_ll.rs` is a Rust port of libfuse's classic `hello_ll.c`: a read-only
+`examples/hello_ll_raw.rs` is a Rust port of libfuse's classic `hello_ll.c`: a read-only
 filesystem exposing a single file, `hello`, containing "Hello World!\n". It uses the
 lowlevel FUSE 3.x API.
 
 ```sh
 mkdir /tmp/hello_mnt
-cargo run --example hello_ll -- /tmp/hello_mnt
+cargo run --example hello_ll_raw -- /tmp/hello_mnt
 ```
 
 In another terminal:

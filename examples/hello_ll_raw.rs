@@ -122,7 +122,11 @@ mod imp {
         unsafe { fuse_reply_entry(req, &e) };
     }
 
-    unsafe extern "C" fn hello_ll_getattr(req: fuse_req_t, ino: fuse_ino_t, _fi: *mut fuse_file_info) {
+    unsafe extern "C" fn hello_ll_getattr(
+        req: fuse_req_t,
+        ino: fuse_ino_t,
+        _fi: *mut fuse_file_info,
+    ) {
         match hello_stat(ino, *mount_time(req)) {
             Some(attr) => {
                 unsafe { fuse_reply_attr(req, &attr, 1.0) };
@@ -177,7 +181,12 @@ mod imp {
         let mut buf = Vec::new();
         unsafe {
             dirbuf_add(req, &mut buf, CStr::from_bytes_with_nul(b".\0").unwrap(), 1);
-            dirbuf_add(req, &mut buf, CStr::from_bytes_with_nul(b"..\0").unwrap(), 1);
+            dirbuf_add(
+                req,
+                &mut buf,
+                CStr::from_bytes_with_nul(b"..\0").unwrap(),
+                1,
+            );
             dirbuf_add(
                 req,
                 &mut buf,
@@ -213,13 +222,14 @@ mod imp {
     }
 
     fn hello_ll_oper() -> fuse_lowlevel_ops {
-        let mut ops = fuse_lowlevel_ops::default();
-        ops.lookup = Some(hello_ll_lookup);
-        ops.getattr = Some(hello_ll_getattr);
-        ops.readdir = Some(hello_ll_readdir);
-        ops.open = Some(hello_ll_open);
-        ops.read = Some(hello_ll_read);
-        ops
+        fuse_lowlevel_ops {
+            lookup: Some(hello_ll_lookup),
+            getattr: Some(hello_ll_getattr),
+            readdir: Some(hello_ll_readdir),
+            open: Some(hello_ll_open),
+            read: Some(hello_ll_read),
+            ..Default::default()
+        }
     }
 
     unsafe fn run_session(args: &mut fuse_args, opts: &fuse_cmdline_opts) -> c_int {
@@ -266,7 +276,10 @@ mod imp {
         let prog_args: Vec<CString> = std::env::args()
             .map(|a| CString::new(a).expect("argument contains a NUL byte"))
             .collect();
-        let mut argv: Vec<*mut c_char> = prog_args.iter().map(|a| a.as_ptr() as *mut c_char).collect();
+        let mut argv: Vec<*mut c_char> = prog_args
+            .iter()
+            .map(|a| a.as_ptr() as *mut c_char)
+            .collect();
         let mut args = fuse_args {
             argc: argv.len() as c_int,
             argv: argv.as_mut_ptr(),

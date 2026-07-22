@@ -22,7 +22,7 @@ bindgen = "0.72.1"
 pkg-config = "0.3"
 
 [[example]]
-name = "hello_ll"
+name = "hello_ll_raw"
 required-features = ["fuse_lowlevel"]
 
 [features]

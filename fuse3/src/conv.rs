@@ -319,7 +319,10 @@ mod tests {
         assert_eq!(st.st_ino as u64, 42);
         assert_eq!(st.st_size as u64, 1234);
         assert_eq!(st.st_nlink as u64, 3);
-        assert_eq!(mode_bits_to_kind(st.st_mode as u32), Some(FileKind::RegularFile));
+        assert_eq!(
+            mode_bits_to_kind(st.st_mode as u32),
+            Some(FileKind::RegularFile)
+        );
         assert_eq!((st.st_mode as u32) & 0o777, 0o644);
     }
 

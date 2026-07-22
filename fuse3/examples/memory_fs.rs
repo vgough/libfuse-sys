@@ -10,6 +10,9 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
@@ -25,9 +28,9 @@ struct DirEntry {
 }
 
 enum Content {
-    Dir(BTreeMap<String, DirEntry>),
+    Dir(BTreeMap<OsString, DirEntry>),
     File(Vec<u8>),
-    Symlink(String),
+    Symlink(PathBuf),
     /// FIFO, socket, or device node; the kernel handles I/O directly.
     Special,
 }
@@ -48,7 +51,7 @@ struct NodeData {
     mtime: SystemTime,
     ctime: SystemTime,
     crtime: SystemTime,
-    xattrs: BTreeMap<String, Vec<u8>>,
+    xattrs: BTreeMap<OsString, Vec<u8>>,
 }
 
 impl Node {
@@ -84,7 +87,7 @@ impl NodeData {
     fn size(&self) -> u64 {
         match &self.content {
             Content::File(v) => v.len() as u64,
-            Content::Symlink(s) => s.len() as u64,
+            Content::Symlink(s) => s.as_os_str().as_bytes().len() as u64,
             _ => 0,
         }
     }
@@ -126,7 +129,7 @@ impl MemoryFs {
     }
 
     /// Validates that `parent` is a directory not already containing `name`.
-    fn check_new_entry(cx: &Cx<'_, Node>, parent: NodeId, name: &str) -> Result<(), Errno> {
+    fn check_new_entry(cx: &Cx<'_, Node>, parent: NodeId, name: &OsStr) -> Result<(), Errno> {
         match cx.get(parent) {
             Some(node) => {
                 let node = node.read();
@@ -143,7 +146,7 @@ impl MemoryFs {
         }
     }
 
-    fn entry(cx: &Cx<'_, Node>, parent: NodeId, name: &str) -> Result<DirEntry, Errno> {
+    fn entry(cx: &Cx<'_, Node>, parent: NodeId, name: &OsStr) -> Result<DirEntry, Errno> {
         let node = cx.get(parent).ok_or(Errno::ENOENT)?;
         let node = node.read();
         match &node.content {
@@ -159,11 +162,17 @@ impl MemoryFs {
     }
 
     /// Records `id` under `name` in directory `parent` and bumps its times.
-    fn link_into(cx: &Cx<'_, Node>, parent: NodeId, name: &str, entry: DirEntry, now: SystemTime) {
+    fn link_into(
+        cx: &Cx<'_, Node>,
+        parent: NodeId,
+        name: &OsStr,
+        entry: DirEntry,
+        now: SystemTime,
+    ) {
         if let Some(node) = cx.get(parent) {
             let mut node = node.write();
             if let Content::Dir(entries) = &mut node.content {
-                entries.insert(name.to_string(), entry);
+                entries.insert(name.to_os_string(), entry);
             }
             if entry.kind == FileKind::Directory {
                 node.nlink += 1;
@@ -178,7 +187,7 @@ impl MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         kind: FileKind,
         content: Content,
         perm: u16,
@@ -208,11 +217,17 @@ impl NodeFs for MemoryFs {
         )
     }
 
-    fn getattr(&self, node: &Node, _c: &Caller) -> Result<NodeAttr, Errno> {
+    fn getattr(&self, node: &Node, _h: Option<&()>, _c: &Caller) -> Result<NodeAttr, Errno> {
         Ok(node.read().attr())
     }
 
-    fn setattr(&self, node: &Node, set: &SetAttr, _c: &Caller) -> Result<NodeAttr, Errno> {
+    fn setattr(
+        &self,
+        node: &Node,
+        _h: Option<&()>,
+        set: &SetAttr,
+        _c: &Caller,
+    ) -> Result<NodeAttr, Errno> {
         let mut node = node.write();
         let now = SystemTime::now();
         let mut changed = false;
@@ -258,10 +273,10 @@ impl NodeFs for MemoryFs {
         Ok(node.attr())
     }
 
-    fn readlink(&self, node: &Node, _c: &Caller) -> Result<String, Errno> {
+    fn readlink(&self, node: &Node, _c: &Caller) -> Result<PathBuf, Errno> {
         let node = node.read();
         match &node.content {
-            Content::Symlink(target) => Ok(target.clone()),
+            Content::Symlink(target) => Ok(PathBuf::from(target)),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -270,7 +285,7 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         _c: &Caller,
     ) -> Result<Option<NodeId>, Errno> {
         match Self::entry(cx, parent, name) {
@@ -284,7 +299,7 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         mode: u32,
         rdev: u32,
         _umask: u32,
@@ -313,7 +328,7 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         mode: u32,
         _umask: u32,
         _c: &Caller,
@@ -333,8 +348,8 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
-        target: &str,
+        name: &OsStr,
+        target: &Path,
         _c: &Caller,
     ) -> Result<NodeId, Errno> {
         self.create_child(
@@ -342,7 +357,7 @@ impl NodeFs for MemoryFs {
             parent,
             name,
             FileKind::Symlink,
-            Content::Symlink(target.to_string()),
+            Content::Symlink(target.to_path_buf()),
             0o777,
             0,
         )
@@ -352,7 +367,7 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
@@ -374,7 +389,7 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         _c: &Caller,
     ) -> Result<(), Errno> {
         let id = Self::entry(cx, parent, name)?.id;
@@ -402,7 +417,7 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         _c: &Caller,
     ) -> Result<(), Errno> {
         let id = Self::entry(cx, parent, name)?.id;
@@ -434,9 +449,9 @@ impl NodeFs for MemoryFs {
         &self,
         cx: &Cx<'_, Node>,
         parent: NodeId,
-        name: &str,
+        name: &OsStr,
         newparent: NodeId,
-        newname: &str,
+        newname: &OsStr,
         _flags: u32,
         _c: &Caller,
     ) -> Result<(), Errno> {
@@ -485,7 +500,7 @@ impl NodeFs for MemoryFs {
             let mut node = node.write();
             if let Content::Dir(entries) = &mut node.content {
                 entries.insert(
-                    newname.to_string(),
+                    newname.to_os_string(),
                     DirEntry {
                         id: target,
                         kind: target_kind,
@@ -538,7 +553,7 @@ impl NodeFs for MemoryFs {
         cx: &Cx<'_, Node>,
         id: NodeId,
         newparent: NodeId,
-        newname: &str,
+        newname: &OsStr,
         _c: &Caller,
     ) -> Result<NodeId, Errno> {
         if Self::kind(cx, id)? == FileKind::Directory {
@@ -609,6 +624,7 @@ impl NodeFs for MemoryFs {
 
     fn readdir(
         &self,
+        _cx: &Cx<'_, Node>,
         node: &Node,
         this: NodeId,
         parent: NodeId,
@@ -624,13 +640,13 @@ impl NodeFs for MemoryFs {
 
         let mut cursor = offset;
         if cursor < 1 {
-            if !sink.add(".", this, FileKind::Directory, 1) {
+            if !sink.add(OsStr::new("."), this, FileKind::Directory, 1) {
                 return Ok(());
             }
             cursor = 1;
         }
         if cursor < 2 {
-            if !sink.add("..", parent, FileKind::Directory, 2) {
+            if !sink.add(OsStr::new(".."), parent, FileKind::Directory, 2) {
                 return Ok(());
             }
             cursor = 2;
@@ -639,7 +655,7 @@ impl NodeFs for MemoryFs {
         let skip = (cursor - 2) as usize;
         for (i, (name, entry)) in entries.iter().enumerate().skip(skip) {
             let next_offset = (i + 3) as u64;
-            if !sink.add(name, entry.id, entry.kind, next_offset) {
+            if !sink.add(name.as_os_str(), entry.id, entry.kind, next_offset) {
                 break;
             }
         }
@@ -652,7 +668,7 @@ impl NodeFs for MemoryFs {
     fn setxattr(
         &self,
         node: &Node,
-        name: &str,
+        name: &OsStr,
         value: &[u8],
         flags: i32,
         _c: &Caller,
@@ -665,7 +681,7 @@ impl NodeFs for MemoryFs {
         if flags & libc::XATTR_REPLACE != 0 && !exists {
             return Err(Errno::ENODATA);
         }
-        node.xattrs.insert(name.to_string(), value.to_vec());
+        node.xattrs.insert(name.to_os_string(), value.to_vec());
         node.ctime = SystemTime::now();
         Ok(())
     }
@@ -673,7 +689,7 @@ impl NodeFs for MemoryFs {
     fn getxattr(
         &self,
         node: &Node,
-        name: &str,
+        name: &OsStr,
         size: usize,
         _c: &Caller,
     ) -> Result<fuse3::XattrReply, Errno> {
@@ -690,7 +706,7 @@ impl NodeFs for MemoryFs {
         let node = node.read();
         let mut names = Vec::new();
         for name in node.xattrs.keys() {
-            names.extend_from_slice(name.as_bytes());
+            names.extend_from_slice(name.as_os_str().as_bytes());
             names.push(0);
         }
         if size == 0 {
@@ -700,7 +716,7 @@ impl NodeFs for MemoryFs {
         }
     }
 
-    fn removexattr(&self, node: &Node, name: &str, _c: &Caller) -> Result<(), Errno> {
+    fn removexattr(&self, node: &Node, name: &OsStr, _c: &Caller) -> Result<(), Errno> {
         let mut node = node.write();
         node.xattrs.remove(name).ok_or(Errno::ENODATA)?;
         node.ctime = SystemTime::now();
@@ -717,7 +733,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = Session::mount_and_run(MemoryFs::new(), &mountpoint, &[]) {
+    if let Err(e) = Session::mount_and_run(MemoryFs::new(), Path::new(&mountpoint), &[]) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

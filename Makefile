@@ -4,7 +4,7 @@ test:
 	cargo test --workspace
 
 hello_ll:
-	cargo build --example hello_ll --features fuse_35
+	cargo build -p libfuse-sys --example hello_ll_raw --features fuse_35
 
 memory_fs:
 	cargo build -p fuse3 --example memory_fs

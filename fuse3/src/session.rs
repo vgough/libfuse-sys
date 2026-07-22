@@ -26,23 +26,26 @@
 //! level, libfuse actually passes a vanilla `stat*`, which `setattr_shim`
 //! reinterprets.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::os::unix::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
 use std::time::Duration;
 
 use libfuse_sys::fuse_lowlevel::{
-    dev_t, fuse_args, fuse_conn_info, fuse_ctx, fuse_entry_param, fuse_file_info, fuse_forget_data,
-    fuse_ino_t, fuse_lowlevel_ops, fuse_opt_free_args, fuse_remove_signal_handlers, fuse_reply_buf,
-    fuse_reply_err, fuse_reply_lseek, fuse_reply_none, fuse_reply_open, fuse_reply_readlink,
-    fuse_reply_write, fuse_reply_xattr, fuse_req_ctx, fuse_req_t, fuse_req_userdata, fuse_session,
-    fuse_session_destroy, fuse_session_loop, fuse_session_mount, fuse_session_new_versioned,
-    fuse_session_unmount, fuse_set_signal_handlers, libfuse_version, mode_t, off_t, stat,
-    FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION,
+    dev_t, flock, fuse_args, fuse_conn_info, fuse_ctx, fuse_entry_param, fuse_file_info,
+    fuse_forget_data, fuse_ino_t, fuse_lowlevel_ops, fuse_opt_free_args,
+    fuse_remove_signal_handlers, fuse_reply_buf, fuse_reply_err, fuse_reply_lock, fuse_reply_lseek,
+    fuse_reply_none, fuse_reply_open, fuse_reply_readlink, fuse_reply_write, fuse_reply_xattr,
+    fuse_req_ctx, fuse_req_t, fuse_req_userdata, fuse_session, fuse_session_destroy,
+    fuse_session_loop, fuse_session_mount, fuse_session_new_versioned, fuse_session_unmount,
+    fuse_set_signal_handlers, libfuse_version, mode_t, off_t, stat, FUSE_HOTFIX_VERSION,
+    FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION,
 };
 use libfuse_sys::fuse_lowlevel::{
     fuse_loop_config, loop_cfg_create_312, loop_cfg_destroy_312, loop_cfg_set_clone_fd_312,
@@ -62,12 +65,14 @@ use crate::darwin::{
     fuse_reply_statfs_vanilla,
 };
 
-use typed_fuse_core::{Caller, Errno, LookupReply, NodeFs, Runtime, XattrReply};
+use typed_fuse_core::{
+    Caller, Errno, FileLock, LockKind, LookupReply, NodeFs, Runtime, XattrReply,
+};
 
 use crate::conv::{
     attr_to_stat, entry_to_entry_param, negative_entry_param, setattr_from_raw, statfs_to_raw,
 };
-use crate::ffi::{apply_open, conn_apply, conn_read, fi_fh, fi_flags, DirBuffer};
+use crate::ffi::{apply_open, conn_apply, conn_read, fi_fh, fi_fh_opt, fi_flags, DirBuffer};
 use typed_fuse_core::{EntryReply, NodeAttr};
 
 // ---------------------------------------------------------------------
@@ -140,23 +145,15 @@ fn caller_of(req: fuse_req_t) -> Caller {
     }
 }
 
-fn c_str<'a>(ptr: *const c_char) -> Result<&'a str, Errno> {
-    unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map_err(|_| Errno::EILSEQ)
+fn c_os_str<'a>(ptr: *const c_char) -> &'a OsStr {
+    OsStr::from_bytes(unsafe { CStr::from_ptr(ptr) }.to_bytes())
 }
 
 /// Decodes a name argument, replying `EILSEQ` and returning from the shim on
 /// invalid UTF-8.
 macro_rules! try_name {
     ($req:expr, $ptr:expr) => {
-        match c_str($ptr) {
-            Ok(s) => s,
-            Err(e) => {
-                reply_err($req, e);
-                return;
-            }
-        }
+        c_os_str($ptr)
     };
 }
 
@@ -211,11 +208,11 @@ fn reply_attr(req: fuse_req_t, ino: u64, attr: &NodeAttr, ttl: Duration) {
 
 /// Sends a `readdir` buffer, translating an empty buffer to the null/zero
 /// reply that signals end-of-stream.
-fn reply_dir_buf(req: fuse_req_t, data: &[u8]) {
+fn reply_dir_buf(req: fuse_req_t, data: &[u8]) -> c_int {
     if data.is_empty() {
-        unsafe { fuse_reply_buf(req, ptr::null(), 0) };
+        unsafe { fuse_reply_buf(req, ptr::null(), 0) }
     } else {
-        unsafe { fuse_reply_buf(req, data.as_ptr() as *const c_char, data.len()) };
+        unsafe { fuse_reply_buf(req, data.as_ptr() as *const c_char, data.len()) }
     }
 }
 
@@ -294,9 +291,9 @@ unsafe extern "C" fn forget_multi_shim<F: NodeFs>(
 unsafe extern "C" fn getattr_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
-    _fi: *mut fuse_file_info,
+    fi: *mut fuse_file_info,
 ) {
-    match call_fs::<F, _>(req, |rt, c| rt.getattr(ino, c)) {
+    match call_fs::<F, _>(req, |rt, c| rt.getattr(ino, fi_fh_opt(fi), c)) {
         Ok(attr) => reply_attr(req, ino, &attr, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
@@ -307,9 +304,10 @@ fn setattr_shim_impl<F: NodeFs>(
     ino: fuse_ino_t,
     attr: *const stat,
     to_set: c_int,
+    fi: *mut fuse_file_info,
 ) {
     let set = setattr_from_raw(attr, to_set);
-    match call_fs::<F, _>(req, |rt, c| rt.setattr(ino, &set, c)) {
+    match call_fs::<F, _>(req, |rt, c| rt.setattr(ino, fi_fh_opt(fi), &set, c)) {
         Ok(a) => reply_attr(req, ino, &a, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
@@ -324,9 +322,9 @@ unsafe extern "C" fn setattr_shim<F: NodeFs>(
     ino: fuse_ino_t,
     attr: *mut fuse_darwin_attr,
     to_set: c_int,
-    _fi: *mut fuse_file_info,
+    fi: *mut fuse_file_info,
 ) {
-    setattr_shim_impl::<F>(req, ino, attr as *const stat, to_set);
+    setattr_shim_impl::<F>(req, ino, attr as *const stat, to_set, fi);
 }
 #[cfg(not(target_os = "macos"))]
 unsafe extern "C" fn setattr_shim<F: NodeFs>(
@@ -334,14 +332,14 @@ unsafe extern "C" fn setattr_shim<F: NodeFs>(
     ino: fuse_ino_t,
     attr: *mut stat,
     to_set: c_int,
-    _fi: *mut fuse_file_info,
+    fi: *mut fuse_file_info,
 ) {
-    setattr_shim_impl::<F>(req, ino, attr as *const stat, to_set);
+    setattr_shim_impl::<F>(req, ino, attr as *const stat, to_set, fi);
 }
 
 unsafe extern "C" fn readlink_shim<F: NodeFs>(req: fuse_req_t, ino: fuse_ino_t) {
     match call_fs::<F, _>(req, |rt, c| rt.readlink(ino, c)) {
-        Ok(target) => match CString::new(target) {
+        Ok(target) => match CString::new(target.as_os_str().as_bytes()) {
             Ok(c) => {
                 unsafe { fuse_reply_readlink(req, c.as_ptr()) };
             }
@@ -412,7 +410,7 @@ unsafe extern "C" fn symlink_shim<F: NodeFs>(
 ) {
     let link = try_name!(req, link);
     let name = try_name!(req, name);
-    match call_fs::<F, _>(req, |rt, c| rt.symlink(parent, name, link, c)) {
+    match call_fs::<F, _>(req, |rt, c| rt.symlink(parent, name, Path::new(link), c)) {
         Ok(entry) => reply_entry(req, &entry, holder_of::<F>(req).ttl()),
         Err(e) => reply_err(req, e),
     }
@@ -565,19 +563,20 @@ unsafe extern "C" fn readdir_shim<F: NodeFs>(
     off: off_t,
     fi: *mut fuse_file_info,
 ) {
+    if off < 0 {
+        reply_err(req, Errno::EINVAL);
+        return;
+    }
     let fh = fi_fh(fi);
     let mut buf = DirBuffer::new(req, size);
     match call_fs::<F, _>(req, |rt, c| rt.readdir(ino, fh, off as u64, &mut buf, c)) {
-        Ok(()) => reply_dir_buf(req, buf.as_slice()),
+        Ok(()) => {
+            reply_dir_buf(req, buf.as_slice());
+        }
         Err(e) => reply_err(req, e),
     }
 }
 
-// libfuse advertises READDIRPLUS whenever the callback is registered (this
-// crate always registers it), after which the kernel never falls back to
-// plain READDIR. A filesystem only implements `NodeFs::readdir`, so this shim
-// drives that same `readdir` into a plus-shaped buffer with nodeid 0 (no
-// lookup performed, no matching `forget` needed).
 unsafe extern "C" fn readdirplus_shim<F: NodeFs>(
     req: fuse_req_t,
     ino: fuse_ino_t,
@@ -585,10 +584,23 @@ unsafe extern "C" fn readdirplus_shim<F: NodeFs>(
     off: off_t,
     fi: *mut fuse_file_info,
 ) {
+    if off < 0 {
+        reply_err(req, Errno::EINVAL);
+        return;
+    }
     let fh = fi_fh(fi);
-    let mut buf = DirBuffer::new_plus_fallback(req, size);
-    match call_fs::<F, _>(req, |rt, c| rt.readdir(ino, fh, off as u64, &mut buf, c)) {
-        Ok(()) => reply_dir_buf(req, buf.as_slice()),
+    let mut buf = DirBuffer::new_plus(req, size, holder_of::<F>(req).ttl());
+    match call_fs::<F, _>(req, |rt, c| {
+        rt.readdirplus(ino, fh, off as u64, &mut buf, c)
+    }) {
+        Ok(retained) => {
+            if reply_dir_buf(req, buf.as_slice()) != 0 {
+                let rt = holder_of::<F>(req);
+                for id in retained {
+                    rt.forget(id.ino(), 1);
+                }
+            }
+        }
         Err(e) => reply_err(req, e),
     }
 }
@@ -786,6 +798,111 @@ unsafe extern "C" fn lseek_shim<F: NodeFs>(
     }
 }
 
+fn lock_from_raw(raw: &flock) -> Result<FileLock, Errno> {
+    if raw.l_whence as i32 != libc::SEEK_SET || raw.l_start < 0 || raw.l_len < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let kind = match raw.l_type {
+        libc::F_RDLCK => LockKind::Read,
+        libc::F_WRLCK => LockKind::Write,
+        libc::F_UNLCK => LockKind::Unlock,
+        _ => return Err(Errno::EINVAL),
+    };
+    let start = raw.l_start as u64;
+    let end = if raw.l_len == 0 {
+        u64::MAX
+    } else {
+        start
+            .checked_add(raw.l_len as u64 - 1)
+            .ok_or(Errno::EINVAL)?
+    };
+    Ok(FileLock {
+        kind,
+        start,
+        end,
+        pid: raw.l_pid as u32,
+    })
+}
+
+fn lock_to_raw(lock: FileLock) -> Result<flock, Errno> {
+    let l_type = match lock.kind {
+        LockKind::Read => libc::F_RDLCK,
+        LockKind::Write => libc::F_WRLCK,
+        LockKind::Unlock => libc::F_UNLCK,
+    };
+    let l_len = if lock.end == u64::MAX {
+        0
+    } else {
+        lock.end
+            .checked_sub(lock.start)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Errno::EINVAL)?
+    };
+    Ok(flock {
+        l_start: lock.start.try_into().map_err(|_| Errno::EINVAL)?,
+        l_len: l_len.try_into().map_err(|_| Errno::EINVAL)?,
+        l_pid: lock.pid.try_into().map_err(|_| Errno::EINVAL)?,
+        l_type: l_type as _,
+        l_whence: libc::SEEK_SET as _,
+    })
+}
+
+unsafe extern "C" fn getlk_shim<F: NodeFs>(
+    req: fuse_req_t,
+    ino: fuse_ino_t,
+    fi: *mut fuse_file_info,
+    raw: *mut flock,
+) {
+    let requested = match lock_from_raw(unsafe { &*raw }) {
+        Ok(v) => v,
+        Err(e) => {
+            reply_err(req, e);
+            return;
+        }
+    };
+    let fh = fi_fh(fi);
+    let owner = if fi.is_null() {
+        0
+    } else {
+        unsafe { (*fi).lock_owner }
+    };
+    match call_fs::<F, _>(req, |rt, c| rt.getlk(ino, fh, owner, requested, c)).and_then(lock_to_raw)
+    {
+        Ok(reply) => {
+            unsafe { fuse_reply_lock(req, &reply) };
+        }
+        Err(e) => reply_err(req, e),
+    }
+}
+
+unsafe extern "C" fn setlk_shim<F: NodeFs>(
+    req: fuse_req_t,
+    ino: fuse_ino_t,
+    fi: *mut fuse_file_info,
+    raw: *mut flock,
+    sleep: c_int,
+) {
+    let requested = match lock_from_raw(unsafe { &*raw }) {
+        Ok(v) => v,
+        Err(e) => {
+            reply_err(req, e);
+            return;
+        }
+    };
+    let fh = fi_fh(fi);
+    let owner = if fi.is_null() {
+        0
+    } else {
+        unsafe { (*fi).lock_owner }
+    };
+    match call_fs::<F, _>(req, |rt, c| {
+        rt.setlk(ino, fh, owner, requested, sleep != 0, c)
+    }) {
+        Ok(()) => reply_ok(req),
+        Err(e) => reply_err(req, e),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn copy_file_range_shim<F: NodeFs>(
     req: fuse_req_t,
@@ -859,9 +976,23 @@ pub(crate) fn make_ops<F: NodeFs>() -> fuse_lowlevel_ops {
         create: Some(create_shim::<F>),
         forget_multi: Some(forget_multi_shim::<F>),
         fallocate: Some(fallocate_shim::<F>),
-        readdirplus: Some(readdirplus_shim::<F>),
+        readdirplus: if F::SUPPORTS_READDIRPLUS {
+            Some(readdirplus_shim::<F>)
+        } else {
+            None
+        },
         copy_file_range: Some(copy_file_range_shim::<F>),
         lseek: Some(lseek_shim::<F>),
+        getlk: if F::SUPPORTS_POSIX_LOCKS {
+            Some(getlk_shim::<F>)
+        } else {
+            None
+        },
+        setlk: if F::SUPPORTS_POSIX_LOCKS {
+            Some(setlk_shim::<F>)
+        } else {
+            None
+        },
         ..Default::default()
     }
 }
@@ -1103,9 +1234,9 @@ impl<F: NodeFs> Session<F> {
     }
 
     /// Mounts the session at `mountpoint`.
-    pub fn mount(&mut self, mountpoint: &str) -> Result<(), Error> {
-        let c_mountpoint = CString::new(mountpoint)
-            .map_err(|_| Error::InvalidMountpoint(mountpoint.to_string()))?;
+    pub fn mount(&mut self, mountpoint: &Path) -> Result<(), Error> {
+        let c_mountpoint = CString::new(mountpoint.as_os_str().as_bytes())
+            .map_err(|_| Error::InvalidMountpoint(mountpoint.display().to_string()))?;
         let rc = unsafe { fuse_session_mount(self.session, c_mountpoint.as_ptr()) };
         if rc != 0 {
             return Err(Error::Mount);
@@ -1137,7 +1268,7 @@ impl<F: NodeFs> Session<F> {
     }
 
     /// Convenience: [`Session::new`] + [`Session::mount`] + [`Session::run`].
-    pub fn mount_and_run(fs: F, mountpoint: &str, options: &[MountOption]) -> Result<(), Error> {
+    pub fn mount_and_run(fs: F, mountpoint: &Path, options: &[MountOption]) -> Result<(), Error> {
         let mut session = Session::new(fs, options)?;
         session.mount(mountpoint)?;
         session.run()
@@ -1145,7 +1276,7 @@ impl<F: NodeFs> Session<F> {
 
     pub fn mount_and_run_with_config(
         fs: F,
-        mountpoint: &str,
+        mountpoint: &Path,
         options: &[MountOption],
         config: SessionConfig,
     ) -> Result<(), Error> {
@@ -1176,13 +1307,19 @@ mod tests {
     use super::*;
     use typed_fuse_core::{Caller, NodeAttr};
 
+    #[test]
+    fn c_names_preserve_non_utf8_bytes() {
+        let name = CString::new([0xff, b'x']).unwrap();
+        assert_eq!(c_os_str(name.as_ptr()).as_bytes(), &[0xff, b'x']);
+    }
+
     struct NullFs;
     impl NodeFs for NullFs {
         type Node = ();
         type Handle = ();
         type DirHandle = ();
         fn root(&mut self) {}
-        fn getattr(&self, _n: &(), _c: &Caller) -> Result<NodeAttr, Errno> {
+        fn getattr(&self, _n: &(), _h: Option<&()>, _c: &Caller) -> Result<NodeAttr, Errno> {
             Ok(NodeAttr::default())
         }
     }
@@ -1224,7 +1361,7 @@ mod tests {
         assert!(ops.create.is_some());
         assert!(ops.forget_multi.is_some());
         assert!(ops.fallocate.is_some());
-        assert!(ops.readdirplus.is_some());
+        assert!(ops.readdirplus.is_none());
         assert!(ops.copy_file_range.is_some());
         assert!(ops.lseek.is_some());
 
@@ -1240,6 +1377,47 @@ mod tests {
         assert!(ops.setvolname.is_none());
         assert!(ops.monitor.is_none());
         assert!(ops.statx.is_none());
+    }
+
+    struct OptInFs;
+    impl NodeFs for OptInFs {
+        type Node = ();
+        type Handle = ();
+        type DirHandle = ();
+        const SUPPORTS_POSIX_LOCKS: bool = true;
+        const SUPPORTS_READDIRPLUS: bool = true;
+        fn root(&mut self) {}
+        fn getattr(&self, _: &(), _: Option<&()>, _: &Caller) -> Result<NodeAttr, Errno> {
+            Ok(NodeAttr::default())
+        }
+    }
+
+    #[test]
+    fn optional_callbacks_are_registered_only_on_opt_in() {
+        let ops = make_ops::<OptInFs>();
+        assert!(ops.readdirplus.is_some());
+        assert!(ops.getlk.is_some());
+        assert!(ops.setlk.is_some());
+    }
+
+    #[test]
+    fn file_lock_conversion_preserves_ranges_and_eof() {
+        for lock in [
+            FileLock {
+                kind: LockKind::Read,
+                start: 7,
+                end: 19,
+                pid: 42,
+            },
+            FileLock {
+                kind: LockKind::Unlock,
+                start: 20,
+                end: u64::MAX,
+                pid: 0,
+            },
+        ] {
+            assert_eq!(lock_from_raw(&lock_to_raw(lock).unwrap()).unwrap(), lock);
+        }
     }
 
     #[test]
