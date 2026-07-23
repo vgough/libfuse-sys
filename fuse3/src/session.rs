@@ -43,14 +43,24 @@ use libfuse_sys::fuse_lowlevel::{
     fuse_remove_signal_handlers, fuse_reply_buf, fuse_reply_err, fuse_reply_lock, fuse_reply_lseek,
     fuse_reply_none, fuse_reply_open, fuse_reply_readlink, fuse_reply_write, fuse_reply_xattr,
     fuse_req_ctx, fuse_req_t, fuse_req_userdata, fuse_session, fuse_session_destroy,
-    fuse_session_loop, fuse_session_mount, fuse_session_new_versioned, fuse_session_unmount,
-    fuse_set_signal_handlers, libfuse_version, mode_t, off_t, stat, FUSE_HOTFIX_VERSION,
-    FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION,
+    fuse_session_loop, fuse_session_mount, fuse_session_unmount, fuse_set_signal_handlers, mode_t,
+    off_t, stat,
 };
 use libfuse_sys::fuse_lowlevel::{
     fuse_loop_config, loop_cfg_create_312, loop_cfg_destroy_312, loop_cfg_set_clone_fd_312,
     loop_cfg_set_idle_threads_312, loop_cfg_set_max_threads_312, session_loop_mt_312,
 };
+
+// macOS's macFUSE ships a patched libfuse with an ABI-versioned
+// `fuse_session_new_versioned()` (and the `libfuse_version` struct it
+// takes); vanilla Linux libfuse only has the plain `fuse_session_new()`.
+#[cfg(target_os = "macos")]
+use libfuse_sys::fuse_lowlevel::{
+    fuse_session_new_versioned, libfuse_version, FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION,
+    FUSE_MINOR_VERSION,
+};
+#[cfg(not(target_os = "macos"))]
+use libfuse_sys::fuse_lowlevel::fuse_session_new;
 
 #[cfg(target_os = "macos")]
 use libfuse_sys::fuse_lowlevel::{fuse_darwin_attr, statfs};
@@ -1190,27 +1200,36 @@ impl<F: NodeFs> Session<F> {
         };
 
         let ops = make_ops::<F>();
-        let mut version = libfuse_version {
-            major: FUSE_MAJOR_VERSION as _,
-            minor: FUSE_MINOR_VERSION as _,
-            hotfix: FUSE_HOTFIX_VERSION as _,
-            ..Default::default()
-        };
-        // The reply/trampoline code always works with vanilla structs.
-        #[cfg(target_os = "macos")]
-        version.set_darwin_extensions_enabled(0);
 
         let mut runtime_value = Runtime::new(fs);
         runtime_value
             .set_parallel_dirops(matches!(config.threading, ThreadingMode::MultiThreaded(_)));
         let runtime: *mut Runtime<F> = Box::into_raw(Box::new(runtime_value));
 
+        #[cfg(target_os = "macos")]
         let session = unsafe {
+            let mut version = libfuse_version {
+                major: FUSE_MAJOR_VERSION as _,
+                minor: FUSE_MINOR_VERSION as _,
+                hotfix: FUSE_HOTFIX_VERSION as _,
+                ..Default::default()
+            };
+            // The reply/trampoline code always works with vanilla structs.
+            version.set_darwin_extensions_enabled(0);
             fuse_session_new_versioned(
                 &mut args,
                 &ops,
                 std::mem::size_of::<fuse_lowlevel_ops>(),
                 &mut version,
+                runtime as *mut c_void,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let session = unsafe {
+            fuse_session_new(
+                &mut args,
+                &ops,
+                std::mem::size_of::<fuse_lowlevel_ops>(),
                 runtime as *mut c_void,
             )
         };
@@ -1372,12 +1391,14 @@ mod tests {
         assert!(ops.write_buf.is_none());
         assert!(ops.retrieve_reply.is_none());
         assert!(ops.flock.is_none());
+        #[cfg(has_tmpfile_op)]
         assert!(ops.tmpfile.is_none());
         #[cfg(target_os = "macos")]
         {
             assert!(ops.setvolname.is_none());
             assert!(ops.monitor.is_none());
         }
+        #[cfg(has_statx_op)]
         assert!(ops.statx.is_none());
     }
 

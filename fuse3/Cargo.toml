@@ -8,6 +8,9 @@ libfuse-sys = { path = "..", default-features = false, features = ["fuse_lowleve
 typed_fuse_core = { path = "../typed_fuse_core" }
 libc = "0.2"
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dev-dependencies]
 anyhow = "1"
 chrono = "0.4"

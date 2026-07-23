@@ -107,6 +107,7 @@ pub(crate) fn apply_open(fi: *mut fuse_file_info, fh: u64, hints: OpenHints) {
         (*fi).set_keep_cache(hints.keep_cache as u32);
         (*fi).set_nonseekable(hints.nonseekable as u32);
         (*fi).set_cache_readdir(hints.cache_readdir as u32);
+        #[cfg(has_parallel_direct_writes)]
         (*fi).set_parallel_direct_writes((hints.direct_io && hints.parallel_direct_writes) as u32);
     }
 }
@@ -266,6 +267,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(has_parallel_direct_writes)]
     fn parallel_direct_writes_requires_direct_io() {
         let mut fi: fuse_file_info = unsafe { std::mem::zeroed() };
         apply_open(

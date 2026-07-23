@@ -235,23 +235,35 @@ mod imp {
     unsafe fn run_session(args: &mut fuse_args, opts: &fuse_cmdline_opts) -> c_int {
         let ops = hello_ll_oper();
         let mut mounted_at = MountTime::now();
-        let mut version = libfuse_version {
-            major: FUSE_MAJOR_VERSION as _,
-            minor: FUSE_MINOR_VERSION as _,
-            hotfix: FUSE_HOTFIX_VERSION as _,
-            ..Default::default()
-        };
-        // Darwin extensions stay disabled: the reply functions above are bound to the
-        // vanilla symbols and use the vanilla struct layouts.
-        #[cfg(target_os = "macos")]
-        version.set_darwin_extensions_enabled(0);
 
+        // macOS's macFUSE ships a patched libfuse with an ABI-versioned
+        // `fuse_session_new_versioned()`; vanilla Linux libfuse only has the
+        // plain `fuse_session_new()`.
+        #[cfg(target_os = "macos")]
         let se = unsafe {
+            let mut version = libfuse_version {
+                major: FUSE_MAJOR_VERSION as _,
+                minor: FUSE_MINOR_VERSION as _,
+                hotfix: FUSE_HOTFIX_VERSION as _,
+                ..Default::default()
+            };
+            // Darwin extensions stay disabled: the reply functions above are bound to the
+            // vanilla symbols and use the vanilla struct layouts.
+            version.set_darwin_extensions_enabled(0);
             fuse_session_new_versioned(
                 args,
                 &ops,
                 size_of::<fuse_lowlevel_ops>(),
                 &mut version,
+                &mut mounted_at as *mut MountTime as *mut c_void,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let se = unsafe {
+            fuse_session_new(
+                args,
+                &ops,
+                size_of::<fuse_lowlevel_ops>(),
                 &mut mounted_at as *mut MountTime as *mut c_void,
             )
         };
@@ -292,10 +304,15 @@ mod imp {
             .map(|a| a.to_string_lossy().into_owned())
             .unwrap_or_else(|| "hello_ll".to_string());
 
+        // Linux's versioned-symbol libfuse build exposes the unsuffixed
+        // `fuse_parse_cmdline` regardless of the requested API version;
+        // macOS's macFUSE needs the FUSE_USE_VERSION-suffixed name.
         #[cfg(feature = "fuse_312")]
         let parse_result = unsafe { parse_cmdline_312(&mut args, &mut opts) };
-        #[cfg(not(feature = "fuse_312"))]
+        #[cfg(all(not(feature = "fuse_312"), target_os = "macos"))]
         let parse_result = unsafe { fuse_parse_cmdline_30(&mut args, &mut opts) };
+        #[cfg(all(not(feature = "fuse_312"), not(target_os = "macos")))]
+        let parse_result = unsafe { fuse_parse_cmdline(&mut args, &mut opts) };
         if parse_result != 0 {
             return 1;
         }

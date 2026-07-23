@@ -20,28 +20,39 @@ pub mod fuse {
     /// Main function of FUSE
     ///
     /// Implemented as a macro in the original fuse header.
+    ///
+    /// macOS's macFUSE ships a patched libfuse with an ABI-versioned
+    /// `fuse_main_real_versioned()` entry point (and the `libfuse_version`
+    /// struct it takes); vanilla Linux libfuse only has the plain
+    /// `fuse_main_real()`.
     pub unsafe fn fuse_main(
         argc: c_int,
         argv: *mut *mut c_char,
         op: *const fuse_operations,
         user_data: *mut c_void,
     ) -> c_int {
-        let mut version = libfuse_version {
-            major: FUSE_MAJOR_VERSION as _,
-            minor: FUSE_MINOR_VERSION as _,
-            hotfix: FUSE_HOTFIX_VERSION as _,
-            ..Default::default()
-        };
         #[cfg(target_os = "macos")]
-        version.set_darwin_extensions_enabled(FUSE_DARWIN_ENABLE_EXTENSIONS as _);
-        fuse_main_real_versioned(
-            argc,
-            argv,
-            op,
-            std::mem::size_of_val(&*op),
-            &mut version,
-            user_data,
-        )
+        {
+            let mut version = libfuse_version {
+                major: FUSE_MAJOR_VERSION as _,
+                minor: FUSE_MINOR_VERSION as _,
+                hotfix: FUSE_HOTFIX_VERSION as _,
+                ..Default::default()
+            };
+            version.set_darwin_extensions_enabled(FUSE_DARWIN_ENABLE_EXTENSIONS as _);
+            fuse_main_real_versioned(
+                argc,
+                argv,
+                op,
+                std::mem::size_of_val(&*op),
+                &mut version,
+                user_data,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            fuse_main_real(argc, argv, op, std::mem::size_of_val(&*op), user_data)
+        }
     }
 }
 
