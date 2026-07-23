@@ -75,14 +75,13 @@ use crate::darwin::{
     fuse_reply_statfs_vanilla,
 };
 
-use typed_fuse_core::{
-    Caller, Errno, FileLock, LockKind, LookupReply, NodeFs, Runtime, XattrReply,
-};
+use typed_fuse_core::{Caller, Errno, FileLock, LookupReply, NodeFs, Runtime, XattrReply};
 
 use crate::conv::{
     attr_to_stat, entry_to_entry_param, negative_entry_param, setattr_from_raw, statfs_to_raw,
 };
 use crate::ffi::{apply_open, conn_apply, conn_read, fi_fh, fi_fh_opt, fi_flags, DirBuffer};
+use crate::file_lock;
 use typed_fuse_core::{EntryReply, NodeAttr};
 
 // ---------------------------------------------------------------------
@@ -807,52 +806,27 @@ unsafe extern "C" fn lseek_shim<F: NodeFs>(
     }
 }
 
+// libfuse's bindgen `flock` and `libc::flock` are separate Rust types over
+// the same C struct, so the two bridge below field by field and the range
+// arithmetic stays in `file_lock`.
 fn lock_from_raw(raw: &flock) -> Result<FileLock, Errno> {
-    if raw.l_whence as i32 != libc::SEEK_SET || raw.l_start < 0 || raw.l_len < 0 {
-        return Err(Errno::EINVAL);
-    }
-    let kind = match raw.l_type as libc::c_int {
-        value if value == libc::F_RDLCK as libc::c_int => LockKind::Read,
-        value if value == libc::F_WRLCK as libc::c_int => LockKind::Write,
-        value if value == libc::F_UNLCK as libc::c_int => LockKind::Unlock,
-        _ => return Err(Errno::EINVAL),
-    };
-    let start = raw.l_start as u64;
-    let end = if raw.l_len == 0 {
-        u64::MAX
-    } else {
-        start
-            .checked_add(raw.l_len as u64 - 1)
-            .ok_or(Errno::EINVAL)?
-    };
-    Ok(FileLock {
-        kind,
-        start,
-        end,
-        pid: raw.l_pid as u32,
-    })
+    let mut owned: libc::flock = unsafe { std::mem::zeroed() };
+    owned.l_type = raw.l_type;
+    owned.l_whence = raw.l_whence;
+    owned.l_start = raw.l_start;
+    owned.l_len = raw.l_len;
+    owned.l_pid = raw.l_pid;
+    file_lock::from_flock(&owned)
 }
 
 fn lock_to_raw(lock: FileLock) -> Result<flock, Errno> {
-    let l_type = match lock.kind {
-        LockKind::Read => libc::F_RDLCK,
-        LockKind::Write => libc::F_WRLCK,
-        LockKind::Unlock => libc::F_UNLCK,
-    };
-    let l_len = if lock.end == u64::MAX {
-        0
-    } else {
-        lock.end
-            .checked_sub(lock.start)
-            .and_then(|n| n.checked_add(1))
-            .ok_or(Errno::EINVAL)?
-    };
+    let owned = file_lock::to_flock(lock)?;
     Ok(flock {
-        l_start: lock.start.try_into().map_err(|_| Errno::EINVAL)?,
-        l_len: l_len.try_into().map_err(|_| Errno::EINVAL)?,
-        l_pid: lock.pid.try_into().map_err(|_| Errno::EINVAL)?,
-        l_type: l_type as _,
-        l_whence: libc::SEEK_SET as _,
+        l_start: owned.l_start,
+        l_len: owned.l_len,
+        l_pid: owned.l_pid,
+        l_type: owned.l_type,
+        l_whence: owned.l_whence,
     })
 }
 
@@ -1323,7 +1297,7 @@ impl<F: NodeFs> Drop for Session<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use typed_fuse_core::{Caller, NodeAttr};
+    use typed_fuse_core::{Caller, LockKind, NodeAttr};
 
     #[test]
     fn c_names_preserve_non_utf8_bytes() {

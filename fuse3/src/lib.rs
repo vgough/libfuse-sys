@@ -13,10 +13,17 @@
 //! [`Runtime`](typed_fuse_core::Runtime), and encodes results back into
 //! `fuse_reply_*`. All per-OS layout handling lives in the `conv` module;
 //! all `unsafe` lives here.
+//!
+//! Filesystems that pass POSIX record locks through to a backing file
+//! descriptor can implement [`NodeFs::getlk`] and [`NodeFs::setlk`] with the
+//! helpers in [`file_lock`], which also owns the `libc::flock` conversions
+//! and the per-OS widths of the `F_*LCK` constants.
 
 mod conv;
 mod ffi;
 mod session;
+
+pub mod file_lock;
 
 #[cfg(target_os = "macos")]
 mod darwin;
