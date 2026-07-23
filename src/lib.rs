@@ -71,6 +71,25 @@ pub mod fuse_lowlevel {
         }
     }
 
+    /// Stable name for the libfuse 3.12 command-line parser API.
+    ///
+    /// As with the multi-thread loop, libfuse's macOS headers use a versioned
+    /// alias while Linux's versioned-symbol build exposes the unsuffixed name.
+    #[cfg(feature = "fuse_312")]
+    pub unsafe fn parse_cmdline_312(
+        args: *mut fuse_args,
+        opts: *mut fuse_cmdline_opts,
+    ) -> ::std::os::raw::c_int {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { fuse_parse_cmdline_312(args, opts) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unsafe { fuse_parse_cmdline(args, opts) }
+        }
+    }
+
     #[cfg(feature = "fuse_312")]
     pub unsafe fn loop_cfg_create_312() -> *mut fuse_loop_config {
         unsafe { fuse_loop_cfg_create() }

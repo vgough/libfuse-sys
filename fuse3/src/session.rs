@@ -802,10 +802,10 @@ fn lock_from_raw(raw: &flock) -> Result<FileLock, Errno> {
     if raw.l_whence as i32 != libc::SEEK_SET || raw.l_start < 0 || raw.l_len < 0 {
         return Err(Errno::EINVAL);
     }
-    let kind = match raw.l_type {
-        libc::F_RDLCK => LockKind::Read,
-        libc::F_WRLCK => LockKind::Write,
-        libc::F_UNLCK => LockKind::Unlock,
+    let kind = match raw.l_type as libc::c_int {
+        value if value == libc::F_RDLCK as libc::c_int => LockKind::Read,
+        value if value == libc::F_WRLCK as libc::c_int => LockKind::Write,
+        value if value == libc::F_UNLCK as libc::c_int => LockKind::Unlock,
         _ => return Err(Errno::EINVAL),
     };
     let start = raw.l_start as u64;
@@ -1374,8 +1374,11 @@ mod tests {
         assert!(ops.retrieve_reply.is_none());
         assert!(ops.flock.is_none());
         assert!(ops.tmpfile.is_none());
-        assert!(ops.setvolname.is_none());
-        assert!(ops.monitor.is_none());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(ops.setvolname.is_none());
+            assert!(ops.monitor.is_none());
+        }
         assert!(ops.statx.is_none());
     }
 

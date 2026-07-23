@@ -293,7 +293,7 @@ mod imp {
             .unwrap_or_else(|| "hello_ll".to_string());
 
         #[cfg(feature = "fuse_312")]
-        let parse_result = unsafe { fuse_parse_cmdline_312(&mut args, &mut opts) };
+        let parse_result = unsafe { parse_cmdline_312(&mut args, &mut opts) };
         #[cfg(not(feature = "fuse_312"))]
         let parse_result = unsafe { fuse_parse_cmdline_30(&mut args, &mut opts) };
         if parse_result != 0 {
