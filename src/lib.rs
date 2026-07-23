@@ -50,14 +50,25 @@ pub mod fuse {
 pub mod fuse_lowlevel {
     include!(concat!(env!("OUT_DIR"), "/fuse_lowlevel.rs"));
 
-    /// Stable names for the libfuse 3.12 multi-thread loop API. Upstream
-    /// exposes version-suffixed loop symbols on some platforms.
+    /// Stable names for the libfuse 3.12 multi-thread loop API.
+    ///
+    /// `fuse_session_loop_mt` resolves to the correct platform-specific
+    /// symbol while bindgen processes the libfuse headers: macOS uses the
+    /// `_312` alias, while Linux's versioned-symbol build exposes the
+    /// unsuffixed name.
     #[cfg(feature = "fuse_312")]
     pub unsafe fn session_loop_mt_312(
         session: *mut fuse_session,
         config: *mut fuse_loop_config,
     ) -> ::std::os::raw::c_int {
-        unsafe { fuse_session_loop_mt_312(session, config) }
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { fuse_session_loop_mt_312(session, config) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            unsafe { fuse_session_loop_mt(session, config) }
+        }
     }
 
     #[cfg(feature = "fuse_312")]
