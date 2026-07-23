@@ -221,6 +221,13 @@ impl NodeFs for MemoryFs {
         Ok(node.read().attr())
     }
 
+    fn opendir(&self, node: &Node, _flags: i32, _c: &Caller) -> Result<Opened<()>, Errno> {
+        if node.read().kind != FileKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok(Opened::new(()))
+    }
+
     fn setattr(
         &self,
         node: &Node,
@@ -748,8 +755,8 @@ mod tests {
     struct Entries(Vec<(String, FileKind)>);
 
     impl DirSink for Entries {
-        fn add(&mut self, name: &str, _id: NodeId, kind: FileKind, _next_offset: u64) -> bool {
-            self.0.push((name.to_string(), kind));
+        fn add(&mut self, name: &OsStr, _id: NodeId, kind: FileKind, _next_offset: u64) -> bool {
+            self.0.push((name.to_string_lossy().into_owned(), kind));
             true
         }
     }
@@ -759,26 +766,41 @@ mod tests {
         let rt = Runtime::new(MemoryFs::new());
         let caller = Caller::default();
 
-        assert_eq!(rt.getattr(NodeId::ROOT.ino(), &caller).unwrap().nlink, 2);
+        assert_eq!(
+            rt.getattr(NodeId::ROOT.ino(), None, &caller).unwrap().nlink,
+            2
+        );
         let child = rt
-            .mkdir(NodeId::ROOT.ino(), "child", 0o755, 0, &caller)
+            .mkdir(NodeId::ROOT.ino(), OsStr::new("child"), 0o755, 0, &caller)
             .unwrap();
         assert_eq!(child.attr.nlink, 2);
-        assert_eq!(rt.getattr(NodeId::ROOT.ino(), &caller).unwrap().nlink, 3);
+        assert_eq!(
+            rt.getattr(NodeId::ROOT.ino(), None, &caller).unwrap().nlink,
+            3
+        );
 
-        rt.rmdir(NodeId::ROOT.ino(), "child", &caller).unwrap();
-        assert_eq!(rt.getattr(NodeId::ROOT.ino(), &caller).unwrap().nlink, 2);
+        rt.rmdir(NodeId::ROOT.ino(), OsStr::new("child"), &caller)
+            .unwrap();
+        assert_eq!(
+            rt.getattr(NodeId::ROOT.ino(), None, &caller).unwrap().nlink,
+            2
+        );
     }
 
     #[test]
     fn readdir_reports_each_entry_kind() {
         let rt = Runtime::new(MemoryFs::new());
         let caller = Caller::default();
-        rt.mkdir(NodeId::ROOT.ino(), "dir", 0o755, 0, &caller)
+        rt.mkdir(NodeId::ROOT.ino(), OsStr::new("dir"), 0o755, 0, &caller)
             .unwrap();
-        rt.symlink(NodeId::ROOT.ino(), "link", "target", &caller)
-            .unwrap();
-        rt.create(NodeId::ROOT.ino(), "file", 0o644, 0, 0, &caller)
+        rt.symlink(
+            NodeId::ROOT.ino(),
+            OsStr::new("link"),
+            Path::new("target"),
+            &caller,
+        )
+        .unwrap();
+        rt.create(NodeId::ROOT.ino(), OsStr::new("file"), 0o644, 0, 0, &caller)
             .unwrap();
 
         let open = rt.opendir(NodeId::ROOT.ino(), 0, &caller).unwrap();
