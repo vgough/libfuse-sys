@@ -149,8 +149,7 @@ fn c_os_str<'a>(ptr: *const c_char) -> &'a OsStr {
     OsStr::from_bytes(unsafe { CStr::from_ptr(ptr) }.to_bytes())
 }
 
-/// Decodes a name argument, replying `EILSEQ` and returning from the shim on
-/// invalid UTF-8.
+/// Decodes a name argument as an OS string, preserving non-UTF-8 Unix bytes.
 macro_rules! try_name {
     ($req:expr, $ptr:expr) => {
         c_os_str($ptr)

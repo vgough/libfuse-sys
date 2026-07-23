@@ -2,7 +2,7 @@
 //!
 //! A read-only filesystem with a single file `hello` containing "Hello World!\n".
 //!
-//! Usage: `cargo run --example hello_ll -- <mountpoint>`
+//! Usage: `cargo run --example hello_ll_raw -- <mountpoint>`
 
 mod imp {
     use libfuse_sys::fuse_lowlevel::*;

@@ -11,15 +11,14 @@ none of it.
 ## What you get
 
 - A `NodeFs` trait with methods like `lookup`, `getattr`, `read`, `write`, `readdir`,
-  ... that take and return plain `std` types (`&str`, `Vec<u8>`, `SystemTime`,
+  ... that take and return plain `std` types (`&OsStr`, `Vec<u8>`, `SystemTime`,
   `Result<T, Errno>`). Every method has a sensible default, so you only implement the
   operations your filesystem actually supports.
 - A `Session` type that owns mounting, the libfuse event loop, and unmounting.
 - No `unsafe`, no C types (`stat`, `c_char`, raw pointers, ...), and no `target_os` cfgs in
   your code - all per-OS differences (timestamp field layout, Darwin's aliased
   `fuse_reply_*`/`fuse_add_direntry` symbols, mode_t width, ...) are handled internally.
-- Filenames are `&str`/`String` - **UTF-8 only, by design**. An incoming name that isn't
-  valid UTF-8 is rejected with `EILSEQ` before your filesystem ever sees it.
+- Filenames are `&OsStr`/`OsString`, so Unix filesystems can preserve non-UTF-8 names.
 - Multi-threaded by default. Callbacks take shared references and may overlap on the same
   filesystem, node, or handle. Mutable state uses `Mutex`, `RwLock`, or atomics at the
   filesystem's chosen granularity. `ThreadingMode::SingleThreaded` is available when
@@ -29,6 +28,7 @@ none of it.
 
 ```rust
 use std::borrow::Cow;
+use std::path::Path;
 use fuse3::{Caller, Errno, FileKind, NodeAttr, NodeFs, Opened, Session};
 
 const HELLO_CONTENT: &[u8] = b"Hello World!\n";
@@ -42,7 +42,12 @@ impl NodeFs for HelloFs {
 
     fn root(&mut self) -> Self::Node { HELLO_CONTENT }
 
-    fn getattr(&self, _node: &&'static [u8], _caller: &Caller) -> Result<NodeAttr, Errno> {
+    fn getattr(
+        &self,
+        _node: &&'static [u8],
+        _handle: Option<&()>,
+        _caller: &Caller,
+    ) -> Result<NodeAttr, Errno> {
         Ok(NodeAttr {
             kind: FileKind::RegularFile,
             perm: 0o444,
@@ -65,9 +70,13 @@ impl NodeFs for HelloFs {
 
 fn main() {
     let mountpoint = std::env::args().nth(1).expect("usage: <mountpoint>");
-    Session::mount_and_run(HelloFs, &mountpoint, &[]).expect("mount failed");
+    Session::mount_and_run(HelloFs, Path::new(&mountpoint), &[]).expect("mount failed");
 }
 ```
+
+This minimal example shows the callback shapes. A mountable filesystem also needs a
+directory root plus the relevant lookup and directory-reading operations; see
+[`examples/hello_ll.rs`](examples/hello_ll.rs) for a complete implementation.
 
 `SessionConfig` controls dispatch. Its default is a ten-worker pool with no idle
 retirement and `clone_fd` disabled. Libfuse limits `max_threads` to 100,000:

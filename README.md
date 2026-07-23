@@ -1,7 +1,5 @@
-# libfuse-sys [![Latest Version]][crates.io] [![Build Status]][travis]
+# libfuse-sys [![Latest Version]][crates.io]
 
-[Build Status]: https://travis-ci.org/Richard-W/libfuse-sys.svg?branch=master
-[travis]: https://travis-ci.org/Richard-W/libfuse-sys
 [Latest Version]: https://img.shields.io/crates/v/libfuse-sys.svg
 [crates.io]: https://crates.io/crates/libfuse-sys
 
@@ -14,12 +12,13 @@
 Add the dependencies to your Cargo.toml
 ```toml
 [dependencies]
-libfuse-sys = { version = "*", features = ["fuse_312"] }
-libc = "*"
+libfuse-sys = { version = "0.4", features = ["fuse_312"] }
+libc = "0.2"
 ```
-You can select other API versions for fuse. Currently supported are
+You can select a FUSE API version. Currently supported are
 * `fuse_31`
 * `fuse_35`
+* `fuse_312` (requires libfuse 3.12 or later)
 
 If no version is selected the crate defaults to version 35.
 
@@ -46,24 +45,35 @@ Linux.
 
 If you're writing a new filesystem, prefer the [`fuse3`](fuse3/) crate in this workspace
 over the raw bindings above. It's a safe, Rust-friendly low-level FUSE API built on top of
-`libfuse-sys`: implement the concurrent `NodeFs` trait with ordinary `&str`/`Result<T, Errno>`
-methods and hand it to `Session` - no `unsafe`, no C types, no `#[cfg(target_os = ...)]`
-required in your code.
+`libfuse-sys`: implement the concurrent `NodeFs` trait with standard Rust types such as
+`&OsStr` and `Result<T, Errno>`, then hand it to `Session` - no `unsafe`, no C types, no
+`#[cfg(target_os = ...)]` required in your code.
 
 ```rust
+use std::path::Path;
+use fuse3::{Caller, Errno, NodeAttr, NodeFs, Session};
+
+struct HelloFs;
+struct Node;
+
 impl NodeFs for HelloFs {
     type Node = Node;
     type Handle = ();
     type DirHandle = ();
 
-    fn root(&mut self) -> Node { Node::root() }
-    fn getattr(&self, node: &Node, caller: &Caller) -> Result<NodeAttr, Errno> {
-        node.getattr(caller)
+    fn root(&mut self) -> Node { Node }
+    fn getattr(
+        &self,
+        _node: &Node,
+        _handle: Option<&()>,
+        _caller: &Caller,
+    ) -> Result<NodeAttr, Errno> {
+        Ok(NodeAttr::default())
     }
     // ... lookup, open, read, readdir
 }
 
-Session::mount_and_run(HelloFs::new(), &mountpoint, &[])?;
+Session::mount_and_run(HelloFs, Path::new(&mountpoint), &[])?;
 ```
 
 Sessions dispatch concurrently by default. Node and handle payloads are `Send + Sync`,
