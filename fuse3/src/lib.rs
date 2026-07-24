@@ -24,6 +24,7 @@ mod ffi;
 mod session;
 
 pub mod file_lock;
+pub mod passthrough;
 
 #[cfg(target_os = "macos")]
 mod darwin;

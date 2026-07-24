@@ -54,13 +54,13 @@ use libfuse_sys::fuse_lowlevel::{
 // macOS's macFUSE ships a patched libfuse with an ABI-versioned
 // `fuse_session_new_versioned()` (and the `libfuse_version` struct it
 // takes); vanilla Linux libfuse only has the plain `fuse_session_new()`.
+#[cfg(not(target_os = "macos"))]
+use libfuse_sys::fuse_lowlevel::fuse_session_new;
 #[cfg(target_os = "macos")]
 use libfuse_sys::fuse_lowlevel::{
     fuse_session_new_versioned, libfuse_version, FUSE_HOTFIX_VERSION, FUSE_MAJOR_VERSION,
     FUSE_MINOR_VERSION,
 };
-#[cfg(not(target_os = "macos"))]
-use libfuse_sys::fuse_lowlevel::fuse_session_new;
 
 #[cfg(target_os = "macos")]
 use libfuse_sys::fuse_lowlevel::{fuse_darwin_attr, statfs};

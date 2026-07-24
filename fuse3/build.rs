@@ -18,7 +18,9 @@ fn header_contains(fuse_lib: &pkg_config::Library, header: &str, needle: &str) -
 fn main() {
     let mut pkgcfg = pkg_config::Config::new();
     pkgcfg.cargo_metadata(false);
-    let fuse_lib = pkgcfg.probe("fuse3").expect("fuse3 pkg-config module not found");
+    let fuse_lib = pkgcfg
+        .probe("fuse3")
+        .expect("fuse3 pkg-config module not found");
 
     println!("cargo:rustc-check-cfg=cfg(has_parallel_direct_writes)");
     println!("cargo:rustc-check-cfg=cfg(has_tmpfile_op)");
